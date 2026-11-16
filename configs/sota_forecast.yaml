@@ -1,0 +1,46 @@
+# SOTA forecasters (PatchTST, iTransformer) for Task 1 and Task 2 on Jena hourly data.
+# Usage: uv run python scripts/train_sota_forecast.py --task 1 --model patchtst
+seed: 42
+data:
+  path: data/jena_hourly.csv
+  datetime_col: datetime
+  datetime_format: null
+  feature_cols: null        # null means every numeric column
+  pred_column: "T (degC)"
+  lookback: 48
+  resample: null
+  train_frac: 0.7
+  val_frac: 0.15
+  period: 24                # seasonal naive period in steps, null to skip
+tasks:
+  # Task 1 scores y[t+2]. The model emits y[t+1], y[t+2] and only the last step is scored.
+  # The windows are the same ones as offset=2, horizon=1, only the target is longer.
+  1: {offset: 1, horizon: 2, score_last_step_only: true}
+  # Task 2 scores all five steps y[t+1 .. t+5].
+  2: {offset: 1, horizon: 5, score_last_step_only: false}
+models:
+  patchtst:
+    d_model: 64
+    n_heads: 4
+    e_layers: 2
+    d_ff: 128
+    dropout: 0.1
+    patch_len: 16
+    stride: 8
+  itransformer:
+    d_model: 128
+    n_heads: 4
+    e_layers: 2
+    d_ff: 128
+    dropout: 0.1
+train:
+  epochs: 10
+  lr: 1.0e-3
+  batch_size: 128
+  clip: 1.0
+  patience: 3
+  loss: huber
+smoke:
+  max_rows: 3000
+  epochs: 2
+output: reports/sota_task{task}_{model}.json

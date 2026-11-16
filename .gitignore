@@ -6,3 +6,5 @@ __pycache__/
 .pyright/
 *.egg-info/
 dist/
+/data/
+/reports/
