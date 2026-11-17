@@ -17,7 +17,7 @@ def write_synthetic_npz(path: Path, n_hours: int = 2400, n_clients: int = 6, see
     np.savez_compressed(
         path,
         values=values,
-        hours=hours.asi8,
+        hours=hours.to_numpy("datetime64[s]"),
         names=np.array(names),
         stable=np.array(names[:-1]),
     )

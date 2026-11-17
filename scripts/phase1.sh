@@ -8,13 +8,16 @@ cd "$(dirname "$0")/.."
 export PATH=/home/data/.local/bin:/home/data/.cargo/bin:$PATH
 export CARGO_HOME=${CARGO_HOME:-/home/data/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-/home/data/.rustup}
 export TORCH_HOME=${TORCH_HOME:-/home/data/.cache/torch}
+# The pod venv inherits the image's PyTorch 2.8 (see scripts/setup_pod_env.sh), so call it
+# directly. `uv run` would re-sync to uv.lock and download a different torch.
+PY=${PY:-.venv/bin/python}
 TS_JOBS=${TS_JOBS:-4}
 OCR_JOBS=${OCR_JOBS:-2}
 LOG=results/phase1/logs
 mkdir -p "$LOG"
 
 for t in 1 2; do
-  uv run python scripts/run_baselines.py --task "$t" > "$LOG/baselines_task$t.log" 2>&1 || echo "baselines task$t failed"
+  "$PY" scripts/run_baselines.py --task "$t" > "$LOG/baselines_task$t.log" 2>&1 || echo "baselines task$t failed"
 done
 
 ts_jobs() {
@@ -28,10 +31,10 @@ ocr_jobs() {
     for m in cnn_attention_lstm cnn_pool_lstm crnn_ctc; do echo "$m $seed"; done
   done
 }
-export LOG
+export LOG PY
 ts_jobs | xargs -P "$TS_JOBS" -L 1 bash -c \
-  'uv run python scripts/run_ts.py --task $0 --model $1 --seed $2 > $LOG/task$0_$1_seed$2.log 2>&1 || echo "FAILED task$0 $1 seed$2"' &
+  '$PY scripts/run_ts.py --task $0 --model $1 --seed $2 > $LOG/task$0_$1_seed$2.log 2>&1 || echo "FAILED task$0 $1 seed$2"' &
 ocr_jobs | xargs -P "$OCR_JOBS" -L 1 bash -c \
-  'uv run python scripts/run_ocr.py --model $0 --seed $1 > $LOG/task3_$0_seed$1.log 2>&1 || echo "FAILED task3 $0 seed$1"' &
+  '$PY scripts/run_ocr.py --model $0 --seed $1 > $LOG/task3_$0_seed$1.log 2>&1 || echo "FAILED task3 $0 seed$1"' &
 wait
 echo "PHASE1_QUEUE_DONE $(date)"

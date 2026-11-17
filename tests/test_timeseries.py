@@ -1,9 +1,10 @@
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from dl_final_prj.baselines import naive_predictions, ridge_predictions
-from dl_final_prj.electricity import TARGET, ElectricityData, split_bounds, stable_clients
+from dl_final_prj.electricity import TARGET, ElectricityData, prepare, split_bounds, stable_clients
 from dl_final_prj.metrics import horizon_report, regression_report
 from dl_final_prj.ts_models import BiRNNForecaster, Seq2SeqForecaster
 
@@ -116,3 +117,37 @@ def test_seq2seq_eval_ignores_teacher_forcing(synthetic_npz):
         a, _ = m(b, teacher_forcing=1.0)
         c, _ = m(b, teacher_forcing=0.0)
     torch.testing.assert_close(a, c)
+
+
+def test_hours_roundtrip_and_calendar_features(synthetic_npz):
+    d = ElectricityData(synthetic_npz, 168, (2,))
+    assert d.hours[0] == pd.Timestamp("2012-01-01 01:00")
+    cal = d.C.numpy()
+    i = 30  # 2012-01-02 07:00, a Monday
+    assert d.hours[i] == pd.Timestamp("2012-01-02 07:00")
+    np.testing.assert_allclose(
+        cal[i, :2], [np.sin(2 * np.pi * 7 / 24), np.cos(2 * np.pi * 7 / 24)], atol=1e-6
+    )
+    np.testing.assert_allclose(cal[i, 2:], [0.0, 1.0], atol=1e-6)
+
+
+def test_prepare_from_raw_ld_file(tmp_path):
+    hours = 24 * 40
+    stamps = pd.date_range("2011-01-01 00:15", periods=hours * 4, freq="15min")
+    rng = np.random.default_rng(0)
+    vals = rng.uniform(1, 9, (len(stamps), 3))
+    vals[: 4 * 24 * 5, 2] = 0  # MT_003 starts late
+    lines = ['"";"MT_001";"MT_235";"MT_003"']
+    for s, v in zip(stamps, vals):
+        lines.append(
+            f'"{s:%Y-%m-%d %H:%M:%S}";' + ";".join(f"{x:.6f}".replace(".", ",") for x in v)
+        )
+    raw = tmp_path / "LD2011_2014.txt"
+    raw.write_text("\n".join(lines) + "\n")
+    audit = prepare(raw, tmp_path / "proc")
+    assert audit["raw_rows"] == hours * 4 and audit["hourly_rows"] == hours
+    assert audit["stable_clients"] == ["MT_001", "MT_235"]
+    assert audit["hourly_first"] == "2011-01-01 01:00:00"
+    z = np.load(tmp_path / "proc" / "electricity_hourly.npz")
+    np.testing.assert_allclose(z["values"][0], vals[:4].mean(0), rtol=1e-6)
+    assert pd.DatetimeIndex(z["hours"])[-1] == pd.Timestamp(stamps[-1])

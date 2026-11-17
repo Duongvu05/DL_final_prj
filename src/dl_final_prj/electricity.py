@@ -61,8 +61,8 @@ def prepare(raw_txt: Path, out_dir: Path) -> dict:
     """Parse LD2011_2014.txt, aggregate to hourly means, freeze the client list, write npz + audit."""
     names, stamps, raw = parse_semicolon_table(str(raw_txt))
     ts = pd.DatetimeIndex(pd.to_datetime(stamps))
-    steps = np.diff(ts.asi8)
-    if not np.all(steps == 15 * 60 * 10**9):
+    steps = np.diff(ts.to_numpy("datetime64[s]").astype(np.int64))
+    if not np.all(steps == 15 * 60):
         raise ValueError("raw timestamps are not a regular 15-minute grid")
     if len(raw) % 4 or int(ts.minute[3]) != 0:
         raise ValueError("expected rows :15 :30 :45 :00 per hour, starting at 00:15")
@@ -110,7 +110,7 @@ def prepare(raw_txt: Path, out_dir: Path) -> dict:
     np.savez_compressed(
         out_dir / "electricity_hourly.npz",
         values=hourly.astype(np.float64),
-        hours=hours.asi8,
+        hours=hours.to_numpy("datetime64[s]"),
         names=np.array(names),
         stable=np.array(stable),
     )

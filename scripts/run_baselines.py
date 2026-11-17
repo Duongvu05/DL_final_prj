@@ -47,7 +47,7 @@ def main() -> None:
                 np.savez_compressed(
                     run_dir / f"pred_{s}.npz",
                     origin=o,
-                    hour=data.hours[o].asi8,
+                    hour=data.hours[o].to_numpy("datetime64[s]"),
                     y_true=y,
                     y_pred=preds[s][name],
                 )

@@ -7,7 +7,7 @@ name = "dlfast"
 version = "0.1.0"
 description = "Rust hot paths for the DL final project"
 requires-python = ">=3.12"
-dependencies = ["numpy>=2"]
+dependencies = ["numpy>=1.26"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

@@ -108,7 +108,12 @@ def main() -> None:
         y = data.true_targets(split)
         metrics[split] = report(y, pred)
         o = data.origins[split]
-        arrays = {"origin": o, "hour": data.hours[o].asi8, "y_true": y, "y_pred": pred}
+        arrays = {
+            "origin": o,
+            "hour": data.hours[o].to_numpy("datetime64[s]"),
+            "y_true": y,
+            "y_pred": pred,
+        }
         if attn is not None:
             arrays["attention"] = attn
         np.savez_compressed(run_dir / f"pred_{split}.npz", **arrays)
