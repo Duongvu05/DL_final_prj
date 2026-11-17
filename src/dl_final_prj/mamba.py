@@ -293,8 +293,12 @@ def static_adapter_rank(deficit: int, d_inner: int) -> int:
     down is d_inner -> r without bias and up is r -> d_inner with bias, so the adapter has
     2*r*d_inner + d_inner parameters. r is chosen so this is closest to `deficit`, the
     number of selection parameters removed minus the static dt/B/C parameters added.
+
+    r is capped at d_inner // 2. A linear d -> r -> d map with r >= d is just one d x d map,
+    so a larger r would count parameters that add no capacity. When the cap binds, the
+    caller must compensate elsewhere (e.g. a wider head) to stay parameter matched.
     """
-    return max(1, round((deficit - d_inner) / (2 * d_inner)))
+    return max(1, min(d_inner // 2, round((deficit - d_inner) / (2 * d_inner))))
 
 
 class _StaticAdapter(nn.Module):

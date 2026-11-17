@@ -6,11 +6,13 @@ ElectricityData.inverse(pred, origins). Only the temporal encoder changes.
 
 - MambaGRUForecaster (Task 1, T1-M0..M4). Linear input projection 11 -> d_model, then a
   BiMamba encoder (Mamba-2, forward and reverse stacks) or, for the matched control T1-M1,
-  a two-layer bidirectional GRU. A one-layer GRU readout runs over the encoder outputs. Its
+  a two-layer bidirectional GRU (with input_proj=False it reads the 11 channels directly,
+  as the Phase 1 BiGRU does). A one-layer GRU readout runs over the encoder outputs. Its
   final state is the Bahdanau query over the readout outputs, and the Phase 1 head sees
   [final, context, target features].
 - MambaSeq2SeqForecaster (Task 2, T2-M0..M4). Linear input projection 11 -> d_model, then a
-  causal (forward-only) Mamba-2 encoder or, for T2-M1, a two-layer LSTM. The Phase 1
+  causal (forward-only) Mamba-2 encoder or, for T2-M1, a two-layer LSTM (with
+  input_proj=False it reads the 11 channels directly, as the Phase 1 LSTM encoder does). The Phase 1
   LSTMCell decoder, horizon embedding, attention and output layer are kept exactly. The
   encoder outputs are projected to the decoder width for the attention memory, and the
   decoder (h, c) comes from a learned linear projection of the last encoder output.
@@ -72,6 +74,21 @@ def _mamba_encoder(
     )
 
 
+def _input_proj(n_features: int, d_model: int, encoder: str, input_proj: bool) -> nn.Module:
+    """Linear(n_features, d_model), or the identity for an RNN encoder with input_proj=False.
+
+    A Linear layer straight before an RNN collapses into the RNN's first-layer input
+    weights (no nonlinearity in between), so for the RNN controls it only adds parameters
+    that do not add capacity. The Mamba encoder needs the projection, because it is the
+    pre-norm residual stream.
+    """
+    if input_proj:
+        return nn.Linear(n_features, d_model)
+    if encoder == "mamba":
+        raise ValueError("the Mamba encoder needs the input projection (input_proj=True)")
+    return nn.Identity()
+
+
 def _diag_aux(diag: dict) -> dict:
     if not diag:
         return {}
@@ -90,7 +107,8 @@ class MambaGRUForecaster(nn.Module):
     static=True gives T1-M2, d_conv=1 with a wider d_inner gives T1-M3 and
     direction="forward" gives T1-M4.
     encoder="bigru": two-layer bidirectional GRU with hidden `enc_hidden` per direction and
-    dropout between layers, over the same input projection (T1-M1).
+    dropout between layers (T1-M1). With input_proj=False it reads the n_features inputs
+    directly, like the Phase 1 BiGRU, otherwise it reads the same input projection.
 
     A one-layer GRU readout (hidden `readout_hidden`) runs over the encoder outputs. With
     attention the Phase 1 AdditiveAttention scores the readout outputs with the final readout
@@ -119,10 +137,12 @@ class MambaGRUForecaster(nn.Module):
         attention: bool = True,
         attn_dim: int = 128,
         head_dim: int = 128,
+        input_proj: bool = True,
     ) -> None:
         super().__init__()
         self.encoder_kind = encoder
-        self.in_proj = nn.Linear(n_features, d_model)
+        self.in_proj = _input_proj(n_features, d_model, encoder, input_proj)
+        rnn_in = d_model if input_proj else n_features
         if encoder == "mamba":
             self.encoder = _mamba_encoder(
                 d_model,
@@ -139,7 +159,7 @@ class MambaGRUForecaster(nn.Module):
             enc_dim = d_model
         elif encoder == "bigru":
             self.encoder = nn.GRU(
-                d_model,
+                rnn_in,
                 enc_hidden,
                 n_layers,
                 batch_first=True,
@@ -194,8 +214,9 @@ class MambaSeq2SeqForecaster(nn.Module):
     encoder="mamba": forward-only BiMamba(d_model, n_layers) over Linear(n_features, d_model),
     so encoder output t depends on input steps <= t only. static=True gives T2-M2, d_conv=1
     with a wider d_inner gives T2-M3 and attention=False gives T2-M4.
-    encoder="lstm": two-layer LSTM with hidden `enc_hidden` and dropout between layers over
-    the same input projection (T2-M1).
+    encoder="lstm": two-layer LSTM with hidden `enc_hidden` and dropout between layers
+    (T2-M1). With input_proj=False it reads the n_features inputs directly, like the Phase 1
+    LSTM encoder, otherwise it reads the same input projection.
 
     The decoder is the Phase 1 one. Its input at step k is [previous standardized residual,
     target features of hour t+k, horizon embedding k, attention context (if attention)]. The
@@ -226,11 +247,13 @@ class MambaSeq2SeqForecaster(nn.Module):
         attention: bool = True,
         attn_dim: int = 128,
         horizon_dim: int = 16,
+        input_proj: bool = True,
     ) -> None:
         super().__init__()
         self.horizon, self.hidden = horizon, hidden
         self.encoder_kind = encoder
-        self.in_proj = nn.Linear(n_features, d_model)
+        self.in_proj = _input_proj(n_features, d_model, encoder, input_proj)
+        rnn_in = d_model if input_proj else n_features
         if encoder == "mamba":
             self.encoder = _mamba_encoder(
                 d_model,
@@ -246,7 +269,7 @@ class MambaSeq2SeqForecaster(nn.Module):
             )
             enc_dim = d_model
         elif encoder == "lstm":
-            self.encoder = nn.LSTM(d_model, enc_hidden, n_layers, batch_first=True, dropout=dropout)
+            self.encoder = nn.LSTM(rnn_in, enc_hidden, n_layers, batch_first=True, dropout=dropout)
             enc_dim = enc_hidden
         else:
             raise ValueError(f"unknown encoder {encoder!r}")
@@ -321,6 +344,12 @@ MAMBA_ONLY_ARGS = (
 )
 
 
+def rnn_control_args(m0_args: dict) -> dict:
+    """M0 args without the Mamba encoder and its input projection (base of M1)."""
+    drop = (*MAMBA_ONLY_ARGS, "d_model", "input_proj")
+    return {**{k: v for k, v in m0_args.items() if k not in drop}, "input_proj": False}
+
+
 def build(kind: str, args: dict, horizon: int) -> nn.Module:
     """Model of `kind` with the Phase 1/2 data dimensions (11 inputs, 10 target features)."""
     return MODEL_KINDS[kind](N_FEATURES, horizon=horizon, n_target_feats=N_TARGET_FEATS, **args)
@@ -339,12 +368,13 @@ def match_rnn_hidden(
 ) -> tuple[int, int]:
     """enc_hidden of the RNN control (M1) whose total count is closest to M0's.
 
-    The control keeps every M0 argument that is not Mamba-specific (input projection width,
-    readout/decoder, attention, head) and swaps the encoder for `rnn`. Returns
-    (enc_hidden, n_params).
+    The control keeps every M0 argument that is not Mamba-specific (readout/decoder,
+    attention, head) and swaps the encoder for `rnn`. It feeds the input channels straight
+    to the RNN (input_proj False), as the Phase 1 models do, so no Linear layer collapses
+    into the RNN input weights. Returns (enc_hidden, n_params).
     """
     target = n_params(kind, m0_args, horizon)
-    base = {k: v for k, v in m0_args.items() if k not in MAMBA_ONLY_ARGS}
+    base = rnn_control_args(m0_args)
     best = min(
         candidates,
         key=lambda h: abs(
@@ -378,9 +408,9 @@ def match_head_count(kind: str, m0_args: dict, horizon: int, change: dict) -> tu
 
     `change` is applied to the M0 args (e.g. direction "forward" or attention False). The
     per-head width ssm_head_dim stays that of M0 and the number of Mamba-2 heads is chosen
-    so the total count is closest to M0's. For T1-M4 this restores roughly the 2 x 6 heads
-    per layer that the bidirectional M0 has across its two stacks. Returns (d_inner,
-    n_params).
+    so the total count is closest to M0's. For T1-M4 this gives 5 heads per layer against
+    the 2 x 2 heads per layer that the bidirectional M0 has across its two stacks. Returns
+    (d_inner, n_params).
     """
     target = n_params(kind, m0_args, horizon)
     p = m0_args.get("ssm_head_dim", 32)
@@ -422,10 +452,11 @@ PHASE1_COURSE_MAIN = {1: "bigru_attention", 2: "seq2seq_attention"}
 
 
 def phase1_budget(cfg: dict, phase1_cfg: dict) -> dict:
-    """M0 against the Phase 1 course-main model of the same task (plan 2.1 budget note).
+    """M0 against the Phase 1 course-main model of the same task (plan 2.1 and 2.2 budgets).
 
-    The phase 2 config keeps d_model=96 and expand=2 from the plan, so M0 is larger than
-    Phase 1 P0. This reports both counts so the report can state the gap.
+    The plan sizes M0 (T1 d_model 96, d_inner 64, T2 d_model 112, d_inner 32) to the Phase 1
+    course-main model. This reports both counts and their ratio, which must stay within
+    PARAM_TOLERANCE of 1.
     """
     from dl_final_prj.ts_models import BiRNNForecaster, Seq2SeqForecaster
 

@@ -21,9 +21,18 @@ fingerprint.json untouched), backs metrics.json up once as metrics_v1_greedy.jso
 predates this decoding, and rewrites metrics.json, the pred_*.json files, attention_test.npz
 and spec.json's decoding entries.
 
-Phase 2 (configs/phase2_task3.yaml, `phase: phase2`) adds the token-mixer kinds of
-ocr_mamba. Their runs go to results/phase2/... and Mamba runs also save the mean dt per
-visual token on the test set (mamba_dt_test.npz).
+Phase 2 (configs/phase2_task3.yaml for Setting A and phase2_task3_whole.yaml for Setting B,
+`phase: phase2`) adds the token-mixer kinds of ocr_mamba. Their runs go to results/phase2/...
+and Mamba runs also save the mean dt per visual token on the test set (mamba_dt_test.npz).
+
+`compile: true` (config key, default false, Phase 2 token-mixer models only) compiles the
+token mixer in place with nn.Module.compile for training and evaluation, on CUDA only. It is
+a no-op on CPU (logged). The in-place compile keeps the state_dict keys of the eager model
+(no `_orig_mod.` prefix), so ckpt.pt, resume and --eval-only work across eager and compiled
+runs. The requested and active values are recorded in spec.json ("compile") and the
+requested value in fingerprint.json. Dynamo does not trace nn.GRU, so in the BiGRU control
+the GRU calls run eager (spec.json "compile.eager_in_mixer"). Train time is therefore
+compile dependent and is not a method comparison.
 """
 
 import argparse
@@ -48,7 +57,13 @@ from dl_final_prj.engine import (
     write_json,
 )
 from dl_final_prj.metrics import sequence_report
-from dl_final_prj.ocr_mamba import P0_PARAMS, MixerAttentionGRURecognizer
+from dl_final_prj.ocr_mamba import (
+    P0_PARAMS,
+    P0_PARTS,
+    PARAM_TOL,
+    MixerAttentionGRURecognizer,
+    rel_param_diff,
+)
 from dl_final_prj.ocr_models import (
     DECODING_TEXT,
     PRIMARY_DECODING,
@@ -74,6 +89,65 @@ WIDTH_SELECTION = (
     "validation exact match, ties to the smaller width, chosen before any test evaluation "
     "and reused for test and the stress split"
 )
+COMPILE_TARGET = (
+    "encoder.mixer (the token mixer), torch.compile in place via nn.Module.compile, the same "
+    "for every token-mixer model. The CNN, the projection and the GRU decoder stay eager"
+)
+# Dynamo does not trace recurrent modules. In a mixer that holds one (the t3_m1 BiGRU) each
+# RNN call is a graph break and runs as eager cuDNN, so only RMSNorm and the fusion Linear
+# are compiled there. allow_rnn stays off. Accuracy comparisons are not affected, but train
+# time is compile dependent and is not a method comparison.
+EAGER_RNN = (torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM)
+COMPILE_TIMING_NOTE = (
+    "train time depends on what torch.compile can trace (see eager_in_mixer), so it is not a "
+    "method comparison between token mixers"
+)
+
+
+def compile_requested(cfg: dict) -> bool:
+    return bool(cfg.get("compile", False))
+
+
+def compile_mixer(model: MixerAttentionGRURecognizer, backend: str = "inductor") -> None:
+    """torch.compile the token mixer in place. Unlike `torch.compile(module)` this does not
+    wrap the module, so the state_dict keys stay those of the eager model. `backend` is
+    inductor in runs. The tests use aot_eager to trace and run the mixer on CPU."""
+    model.encoder.mixer.compile(backend=backend)
+
+
+def eager_in_mixer(model) -> list[str]:
+    """Recurrent module types in the token mixer that Dynamo leaves eager (graph breaks)."""
+    if not isinstance(model, MixerAttentionGRURecognizer):
+        return []
+    found = {type(m).__name__ for m in model.encoder.mixer.modules() if isinstance(m, EAGER_RNN)}
+    return sorted(found)
+
+
+def strip_compile_prefix(state: dict) -> dict:
+    """state_dict without `_orig_mod.` segments (left by a torch.compile(module) wrapper)."""
+    return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
+
+def apply_compile(model, cfg: dict, device: str) -> dict:
+    """Applies the config's `compile` key. Active only on CUDA (no-op on CPU, logged).
+    Returns the spec.json record."""
+    requested = compile_requested(cfg)
+    if requested and not isinstance(model, MixerAttentionGRURecognizer):
+        raise SystemExit("compile: true applies to the Phase 2 token-mixer models only")
+    active = requested and device == "cuda"
+    if active:
+        assert isinstance(model, MixerAttentionGRURecognizer)
+        compile_mixer(model)
+        logger.info("compile: torch.compile on the token mixer (in place)")
+    elif requested:
+        logger.info(f"compile: requested but not active on {device} (CUDA only), eager run")
+    return {
+        "requested": requested,
+        "active": active,
+        "target": COMPILE_TARGET,
+        "eager_in_mixer": eager_in_mixer(model),
+        "timing_note": COMPILE_TIMING_NOTE,
+    }
 
 
 @torch.no_grad()
@@ -227,7 +301,11 @@ def mamba_diagnostics(model, split: SvhnSplit, bs: int, amp: bool) -> dict | Non
     model.eval()
     dts, diag = [], {}
     for b in split.iterate(bs):
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        # eager even when the mixer is compiled: the diagnostics path returns python objects
+        with (
+            torch.compiler.set_stance("force_eager"),
+            torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp),
+        ):
             diag = model.mixer_diagnostics(b.images)
         if "dt_mean" not in diag:
             return None
@@ -258,15 +336,19 @@ def mixer_architecture(model: MixerAttentionGRURecognizer, crop: int) -> dict:
 
 
 def param_match(model: MixerAttentionGRURecognizer) -> dict:
-    """spec.json record of the plan 2.3 P0 budget deviation (see configs/phase2_task3.yaml)."""
+    """spec.json record of the plan 2.3 budget (see configs/phase2_task3.yaml)."""
     n = count_params(model)
     return {
         "matched_control": "t3_m1 (and t3_m2..t3_m4), all within 5% of t3_m0",
+        "tolerance": PARAM_TOL,
         "t3_p0_cnn_attention_gru_params": P0_PARAMS,
-        "rel_diff_vs_t3_p0": n / P0_PARAMS - 1,
-        "note": "plan 2.3 asks for T3-M0 within 5% of T3-P0. The plan's fixed Mamba settings "
-        "(two residual bidirectional blocks, d_model 256, expand 2, d_state 16) make that "
-        "impossible, so T3-M0 vs T3-P0 is not a budget-matched contrast",
+        "t3_p0_parts": P0_PARTS,
+        "rel_diff_vs_t3_p0": rel_param_diff(n, P0_PARAMS),
+        "note": "plan 2.3 fixes T3-M0 (d_model 128, two per-layer-fused bidirectional Mamba-1 "
+        "layers, d_state 16, d_conv 4, expand 2, 2-D positions) within 5% of T3-P0, and "
+        "T3-M1..M4 within 5% of T3-M0. M0 matches P0 in total only. P0 reads 512-d tokens, "
+        "so about 0.6M parameters of its positions and decoder sit in the M0 projection and "
+        "mixer (compare t3_p0_parts with n_params_breakdown)",
     }
 
 
@@ -275,9 +357,10 @@ def bench(model, a, cfg: dict, device: str, amp: bool) -> None:
     and labels at the config batch size. Logs ms/step, peak CUDA memory and the projected
     train time per epoch and per run (validation and evaluation excluded). Writes nothing."""
     bs, max_len, fcfg = cfg["batch_size"], cfg["max_len"], FitConfig(**cfg["fit"])
-    if a.compile:
-        enc = model.encoder
-        enc.mixer = torch.compile(enc.mixer)  # type: ignore[assignment]
+    if a.compile:  # the same in-place compile as `compile: true` in a run
+        if not isinstance(model, MixerAttentionGRURecognizer):
+            raise SystemExit("--compile applies to the Phase 2 token-mixer models only")
+        compile_mixer(model)
     g = torch.Generator().manual_seed(0)
     lengths = torch.randint(1, max_len + 1, (bs,), generator=g)
     labels = [
@@ -531,9 +614,10 @@ def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
     kind = mcfg["kind"]
     extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
     model = build(kind, mcfg.get("args"), cfg["max_len"], **extra)
-    model.load_state_dict(ck["best_state"])
+    model.load_state_dict(strip_compile_prefix(ck["best_state"]))
     model = model.to(device).eval()
     del ck
+    compile_info = apply_compile(model, cfg, device)
     amp = FitConfig(**cfg["fit"]).amp == "bf16" and device == "cuda"
     data = load_data(cfg, cache, device, a.smoke, train=False)
     stress = stress_split(cfg)
@@ -561,6 +645,8 @@ def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
         "data": {s: file_identity(cache / f"{s}{suffix}_images.npy") for s in ("val", "test")},
         "note": "re-evaluated from ckpt.pt best_state, no training",
     }
+    if isinstance(model, MixerAttentionGRURecognizer):
+        spec["eval_only"]["compile"] = compile_info
     write_json(spec, run_dir / "spec.json")
     log_result(run_dir, metrics, stress)
 
@@ -580,7 +666,8 @@ def main() -> None:
     ap.add_argument("--bench", type=int, default=0, metavar="N", help=bench_help)
     ap.add_argument("--bench-warmup", type=int, default=5)
     ap.add_argument("--scan", choices=["parallel", "loop"], help="--bench only: Mamba scan")
-    ap.add_argument("--compile", action="store_true", help="--bench only: torch.compile mixer")
+    compile_help = "--bench only: torch.compile the mixer (runs use the config key `compile`)"
+    ap.add_argument("--compile", action="store_true", help=compile_help)
     a = ap.parse_args()
 
     cfg = yaml.safe_load(Path(a.config).read_text())
@@ -621,6 +708,10 @@ def main() -> None:
         "smoke": a.smoke,
         "data": file_identity(cache / f"train{suffix}_images.npy"),
     }
+    if kind in MIXER_KINDS:  # Phase 1 fingerprints stay as they were
+        fingerprint["compile"] = compile_requested(cfg)
+    elif compile_requested(cfg):
+        raise SystemExit("compile: true applies to the Phase 2 token-mixer models only")
     prepare_run_dir(run_dir, fingerprint, a.force)
     device = pick_device()
     data = load_data(cfg, cache, device, a.smoke)
@@ -629,6 +720,7 @@ def main() -> None:
     set_seed(a.seed)  # seeds the weight initialization too, not only training
     extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
     model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+    compile_info = apply_compile(model, cfg, device)
     fcfg = FitConfig(**cfg["fit"])
     amp = fcfg.amp == "bf16" and device == "cuda"
     if not amp:
@@ -660,6 +752,8 @@ def main() -> None:
     spec = build_spec(
         a, cfg, mcfg, model, data, history, metrics, diag, fcfg, device, t0, run_dir, cache
     )
+    if isinstance(model, MixerAttentionGRURecognizer):
+        spec["compile"] = compile_info
     write_json(history, run_dir / "history.json")
     write_json(spec, run_dir / "spec.json")
     write_eval(run_dir, metrics, preds, attention)  # metrics.json last: it marks the run done

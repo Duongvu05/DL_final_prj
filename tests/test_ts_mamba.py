@@ -22,7 +22,9 @@ from dl_final_prj.ts_mamba import (
     build,
     matched_widths,
     n_params,
+    param_table,
     phase1_budget,
+    rnn_control_args,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,27 +99,68 @@ def test_ablations_differ_from_m0_only_where_intended():
     for t, change in M4_CHANGE.items():
         m4_change = {**change, "d_inner": mcfg(f"t{t}_m4")["args"]["d_inner"]}
         m0 = mcfg(f"t{t}_m0")["args"]
-        assert mcfg(f"t{t}_m2")["args"] == {**m0, "static": True}
-        m3 = mcfg(f"t{t}_m3")["args"]
         width = ("d_conv", "ssm_head_dim", "d_inner")
+        m2 = mcfg(f"t{t}_m2")["args"]
+        # M2 = M0 + static; it may only widen the head when the adapter rank cap binds (T2)
+        assert {k: v for k, v in m2.items() if k not in width[1:]} == {
+            **{k: v for k, v in m0.items() if k not in width[1:]},
+            "static": True,
+        }
+        assert m2["d_inner"] == m2["ssm_head_dim"] * (m0["d_inner"] // m0["ssm_head_dim"])
+        m3 = mcfg(f"t{t}_m3")["args"]
         assert {k: v for k, v in m3.items() if k not in width} == {
             k: v for k, v in m0.items() if k not in width
         }
         m4 = {k: v for k, v in mcfg(f"t{t}_m4")["args"].items() if k != "attn_dim"}
         assert m4 == {**{k: v for k, v in m0.items() if k != "attn_dim"}, **m4_change}
-        assert mcfg(f"t{t}_m1")["args"]["encoder"] == ("bigru" if t == 1 else "lstm")
+        rnn = "bigru" if t == 1 else "lstm"
+        m1 = mcfg(f"t{t}_m1")["args"]
+        assert m1 == {**rnn_control_args(m0), "encoder": rnn, "enc_hidden": m1["enc_hidden"]}
 
 
-def test_phase1_budget_gap_is_reported():
-    """Plan 2.1 budget deviation: the config header must state the real counts."""
+@pytest.mark.parametrize("name", ["t1_m1", "t2_m1"])
+def test_rnn_control_reads_the_raw_inputs(name):
+    """No Linear layer before the RNN, so none collapses into its input weights."""
+    m = model_for(name)
+    assert isinstance(m.in_proj, torch.nn.Identity)
+    assert m.encoder.input_size == N_FEATURES
+    if name == "t1_m1":  # the Phase 1 attentive BiGRU width
+        p1 = yaml.safe_load((ROOT / "configs" / "phase1.yaml").read_text())
+        assert m.encoder.hidden_size == p1["task1"]["models"]["bigru_attention"]["args"]["hidden"]
+    with pytest.raises(ValueError, match="input projection"):
+        model_for(f"t{name[1]}_m0", input_proj=False)
+
+
+@pytest.mark.parametrize("name", ["t1_m2", "t2_m2"])
+def test_static_adapter_is_not_overcomplete(name):
+    """A linear d -> r -> d adapter with r >= d is just one d x d map (redundant parameters).
+
+    mamba.static_adapter_rank caps r at d_inner // 2, and T2-M2 compensates with a wider head.
+    """
+    mixers = [x for x in model_for(name).modules() if isinstance(x, Mamba2Mixer)]
+    assert mixers
+    for mx in mixers:
+        assert mx.adapter.down.out_features <= mx.d_inner // 2, (mx.d_inner, mx.adapter)
+
+
+def test_m0_matches_the_phase1_budget():
+    """Plan 2.1 and 2.2 fix M0 to the Phase 1 course-main budget (within 5%)."""
     p1 = yaml.safe_load((ROOT / "configs" / "phase1.yaml").read_text())
     b = phase1_budget(CFG, p1)
     assert b["task1"]["phase1_p0"] == 171_925 and b["task2"]["phase1_p0"] == 110_033
-    header = (ROOT / "configs" / "phase2.yaml").read_text()
-    assert "PLAN DEVIATION" in header
+    assert b["task1"]["m0"] == 175_181 and b["task2"]["m0"] == 110_023
     for t in (1, 2):
-        assert f"{b[f'task{t}']['m0']:,}" in header
-        assert f"{b[f'task{t}']['phase1_p0']:,}" in header
+        assert abs(b[f"task{t}"]["ratio"] - 1) <= PARAM_TOLERANCE
+
+
+def test_config_header_states_the_exact_counts():
+    header = (ROOT / "configs" / "phase2.yaml").read_text()
+    assert "PLAN DEVIATION" not in header
+    p1 = yaml.safe_load((ROOT / "configs" / "phase1.yaml").read_text())
+    for t, b in phase1_budget(CFG, p1).items():
+        assert f"{b['m0']:,}" in header and f"{b['phase1_p0']:,}" in header, t
+    for r in param_table(CFG):
+        assert f"{r['model']} {r['n_params']:,}" in header, r
 
 
 def test_m0_follows_plan_sizes():
@@ -126,13 +169,17 @@ def test_m0_follows_plan_sizes():
     assert m.in_proj.in_features == N_FEATURES and m.in_proj.out_features == 96
     mixers = [x for x in m.modules() if isinstance(x, Mamba2Mixer)]
     assert len(mixers) == 4  # 2 layers x (forward, reverse)
-    assert all(x.d_state == 16 and x.d_inner == 192 and x.n_heads == 6 for x in mixers)
+    assert all(x.d_state == 16 and x.d_inner == 64 and x.n_heads == 2 for x in mixers)
     assert all(x.conv.kernel == 4 for x in mixers)
     assert m.readout.num_layers == 1 and m.readout.hidden_size == 64
     assert m.head[1].in_features == 64 + 64 + 10 and m.head[1].out_features == 128
     m2 = model_for("t2_m0")
     assert isinstance(m2, MambaSeq2SeqForecaster)
-    assert len([x for x in m2.modules() if isinstance(x, Mamba2Mixer)]) == 2
+    assert m2.in_proj.in_features == N_FEATURES and m2.in_proj.out_features == 112
+    mixers2 = [x for x in m2.modules() if isinstance(x, Mamba2Mixer)]
+    assert len(mixers2) == 2  # 2 causal blocks
+    assert all(x.d_state == 16 and x.d_inner == 32 and x.n_heads == 1 for x in mixers2)
+    assert all(x.conv.kernel == 4 for x in mixers2)
     assert m2.decoder.hidden_size == 64 and m2.decoder.input_size == 1 + 10 + 16 + 64
     assert m2.out.in_features == 128
 
@@ -196,8 +243,9 @@ def test_static_selection_ignores_the_input(name, batches):
     m = model_for(name).eval()
     mixers = [x for x in m.modules() if isinstance(x, Mamba2Mixer)]
     assert mixers and all(x.static for x in mixers)
-    u1 = torch.randn(2, 168, 96)
-    u2 = torch.randn(2, 168, 96) * 3 + 1
+    d_model = mcfg(name)["args"]["d_model"]
+    u1 = torch.randn(2, 168, d_model)
+    u2 = torch.randn(2, 168, d_model) * 3 + 1
     for mx in mixers:
         x1, _, dt1, B1, C1 = mx.ssm_inputs(u1)
         x2, _, dt2, B2, C2 = mx.ssm_inputs(u2)

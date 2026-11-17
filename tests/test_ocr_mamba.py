@@ -14,7 +14,11 @@ import yaml
 
 from dl_final_prj.mamba import BiMamba, Mamba1Mixer, MambaBlock
 from dl_final_prj.ocr_mamba import (
+    D_MODEL,
+    GRU_HIDDEN,
     P0_PARAMS,
+    P0_PARTS,
+    PARAM_TOL,
     BiGRULayer,
     BiGRUMixer,
     BiMambaLayer,
@@ -23,6 +27,7 @@ from dl_final_prj.ocr_mamba import (
     MambaAttentionGRURecognizer,
     MixerAttentionGRURecognizer,
     VisionBiMamba,
+    rel_param_diff,
 )
 from dl_final_prj.ocr_models import (
     BEAM_WIDTHS,
@@ -31,39 +36,62 @@ from dl_final_prj.ocr_models import (
     primary_mode,
     search_widths,
 )
-from dl_final_prj.svhn import MAX_LEN, decode, prepare
+from dl_final_prj.svhn import MAX_LEN, decode, prepare, prepare_whole
 from dl_final_prj.ts_models import count_params
-from test_svhn import ocr_batch, write_raw
+from test_svhn import load_run_ocr, ocr_batch, write_raw
 
 ROOT = Path(__file__).resolve().parents[1]
-CFG = yaml.safe_load((ROOT / "configs" / "phase2_task3.yaml").read_text())
+CFG_PATH = ROOT / "configs" / "phase2_task3.yaml"
+WHOLE_PATH = ROOT / "configs" / "phase2_task3_whole.yaml"
+CFG = yaml.safe_load(CFG_PATH.read_text())
+CFG_WHOLE = yaml.safe_load(WHOLE_PATH.read_text())
 P1_CFG = yaml.safe_load((ROOT / "configs" / "phase1_task3.yaml").read_text())
+P1_WHOLE = yaml.safe_load((ROOT / "configs" / "phase1_task3_whole.yaml").read_text())
 MODELS = ["t3_m0", "t3_m1", "t3_m2", "t3_m3", "t3_m4"]
+D = 128  # plan 2.3 token width (d_model) of every Phase 2 Task 3 model
 # exact trainable parameter counts, also recorded in configs/phase2_task3.yaml
 N_PARAMS = {
-    "t3_m0": 7_947_282,
-    "t3_m1": 7_942_546,
-    "t3_m2": 7_945_362,
-    "t3_m3": 7_685_138,
-    "t3_m4": 7_943_698,
+    "t3_m0": 6_198_546,
+    "t3_m1": 6_197_814,
+    "t3_m2": 6_197_650,
+    "t3_m3": 6_133_010,
+    "t3_m4": 6_196_754,
 }
+LATE_PARAMS = 6_166_034  # t3_m0 with `mamba: {fusion: late}` (the older BiMamba design)
+# settings keys (and the title) that may differ between a crop and a whole-image config
+SETTING_KEYS = {"cache_suffix", "stress_split", "title"}
 
 
-def make(name: str, seed: int = 0) -> MixerAttentionGRURecognizer:
+def make(name: str, seed: int = 0, cfg: dict = CFG) -> MixerAttentionGRURecognizer:
     torch.manual_seed(seed)
-    m = CFG["models"][name]
-    model = build(m["kind"], m["args"], CFG["max_len"], length_loss_weight=0.2)
+    m = cfg["models"][name]
+    model = build(m["kind"], m["args"], cfg["max_len"], length_loss_weight=0.2)
     assert isinstance(model, MixerAttentionGRURecognizer)
     return model
 
 
-def test_config_matches_phase1_except_models():
-    skip = ("models", "phase")
-    assert {k: v for k, v in CFG.items() if k not in skip} == {
-        k: v for k, v in P1_CFG.items() if k not in skip
+@pytest.mark.parametrize("cfg,p1", [(CFG, P1_CFG), (CFG_WHOLE, P1_WHOLE)])
+def test_config_matches_phase1_except_models(cfg, p1):
+    skip = ("models", "phase", "compile")
+    assert {k: v for k, v in cfg.items() if k not in skip} == {
+        k: v for k, v in p1.items() if k not in skip
     }
-    assert CFG["phase"] == "phase2" and "phase" not in P1_CFG
+    assert cfg["phase"] == "phase2" and "phase" not in p1
+    assert cfg["compile"] is True and "compile" not in p1
+
+
+def test_whole_config_differs_only_by_setting_keys_and_names():
     assert sorted(CFG["models"]) == MODELS
+    assert sorted(CFG_WHOLE["models"]) == [f"{n}_whole" for n in MODELS]
+    for n in MODELS:
+        assert CFG_WHOLE["models"][f"{n}_whole"] == CFG["models"][n], n
+    keys = set(CFG) | set(CFG_WHOLE)
+    diff = {k for k in keys if k not in CFG or k not in CFG_WHOLE or CFG[k] != CFG_WHOLE[k]}
+    assert diff == SETTING_KEYS | {"models"}
+    assert "cache_suffix" not in CFG and "stress_split" not in CFG
+    assert CFG_WHOLE["cache_suffix"] == "_full" and CFG_WHOLE["stress_split"] is None
+    assert CFG_WHOLE["results_root"] == CFG["results_root"] == "results"
+    assert CFG_WHOLE["phase"] == "phase2" and CFG_WHOLE["fit"] == CFG["fit"]
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -101,28 +129,42 @@ def test_length_constraint_and_beam_width_one(name):
         greedy, aux = model.predict(b.images, "greedy")
         ids, att = model.beam(b.images, 1)
         assert [decode(s) for s in ids.tolist()] == greedy
-        torch.testing.assert_close(att, aux["attention"])
+        # equal up to EOS (after it greedy keeps decoding and a finished beam reads PAD)
+        for i, s in enumerate(greedy):
+            torch.testing.assert_close(att[i, : len(s) + 1], aux["attention"][i, : len(s) + 1])
         ids5, att5 = model.beam(b.images, 5)
         _, _, forced = model(b.images, ids5)  # the attention of the chosen beam
         torch.testing.assert_close(att5, forced, atol=1e-5, rtol=1e-4)
 
 
-def test_parameter_counts_match_m0_within_5_percent():
-    counts = {n: count_params(make(n)) for n in MODELS}
+@pytest.mark.parametrize("cfg,suffix", [(CFG, ""), (CFG_WHOLE, "_whole")])
+def test_parameter_counts_match_m0_within_5_percent(cfg, suffix):
+    counts = {n: count_params(make(n + suffix, cfg=cfg)) for n in MODELS}
     assert counts == N_PARAMS
-    for n in MODELS[1:]:
-        assert abs(counts[n] - counts["t3_m0"]) / counts["t3_m0"] < 0.05, n
+    # plan 2.3: T3-M0 is budget matched to the Phase 1 cnn_attention_gru (T3-P0)
+    assert count_params(build("attention")) == P0_PARAMS
+    assert abs(rel_param_diff(counts["t3_m0"], P0_PARAMS)) < 0.001 < PARAM_TOL
+    for n in MODELS[1:]:  # and every control to T3-M0
+        assert abs(rel_param_diff(counts[n], counts["t3_m0"])) < PARAM_TOL, n
     # the token mixers themselves are matched too (M1 and M2 within 1%)
-    mix = {n: make(n).param_breakdown()["token_mixer"] for n in MODELS}
+    mix = {n: make(n + suffix, cfg=cfg).param_breakdown()["token_mixer"] for n in MODELS}
     assert abs(mix["t3_m1"] / mix["t3_m0"] - 1) < 0.01
     assert abs(mix["t3_m2"] / mix["t3_m0"] - 1) < 0.01
-    # without the depth compensation (2 forward layers) M3 would be far outside 5%
-    m3 = CFG["models"]["t3_m3"]["args"]
+    # M1: hidden 141 is the closest BiGRU width to M0
+    m1 = cfg["models"]["t3_m1" + suffix]["args"]
+    assert m1["gru_hidden"] == GRU_HIDDEN and m1["d_model"] == D_MODEL == D
+    gaps = {
+        h: abs(
+            count_params(GRUMixerAttentionGRURecognizer(**(m1 | {"gru_hidden": h})))
+            - counts["t3_m0"]
+        )
+        for h in (GRU_HIDDEN - 1, GRU_HIDDEN + 1)
+    }
+    assert all(g > abs(counts["t3_m1"] - counts["t3_m0"]) for g in gaps.values())
+    # a 2-layer forward-only M3 would be at the edge of 5% with half the Mamba mixers
+    m3 = cfg["models"]["t3_m3" + suffix]["args"]
     plain = MambaAttentionGRURecognizer(**(m3 | {"mamba": m3["mamba"] | {"n_layers": 2}}))
-    assert count_params(plain) / counts["t3_m0"] - 1 < -0.10
-    # T3-P0 budget deviation (plan 2.3), recorded in the config and spec.json
-    assert count_params(build("attention")) == P0_PARAMS
-    assert counts["t3_m0"] / P0_PARAMS - 1 > 0.05
+    assert -0.05 < rel_param_diff(count_params(plain), counts["t3_m0"]) < -0.045
 
 
 def test_m3_keeps_the_m0_mixer_config_and_mixer_count():
@@ -133,7 +175,7 @@ def test_m3_keeps_the_m0_mixer_config_and_mixer_count():
     assert len(mix0) == len(mix3) == 4
     shapes = lambda ms: [{n: p.shape for n, p in m.named_parameters()} for m in ms]  # noqa: E731
     assert shapes(mix0) == shapes(mix3)
-    assert all(isinstance(m, Mamba1Mixer) and m.d_inner == 512 for m in mix3)
+    assert all(isinstance(m, Mamba1Mixer) and m.d_inner == 2 * D for m in mix3)
     assert m3.direction == "forward" and m3.n_layers == 4
 
 
@@ -142,15 +184,34 @@ def test_breakdown_and_mixer_types():
     assert isinstance(m0, MambaAttentionGRURecognizer)
     assert isinstance(m1, GRUMixerAttentionGRURecognizer)
     assert isinstance(m0.encoder.mixer, VisionBiMamba)
-    assert isinstance(m1.encoder.mixer, BiGRUMixer) and m1.encoder.mixer.hidden == 272
+    assert isinstance(m1.encoder.mixer, BiGRUMixer) and m1.encoder.mixer.hidden == 141
     b0, b1 = m0.param_breakdown(), m1.param_breakdown()
     assert b0["total"] == count_params(m0) and b1["total"] == count_params(m1)
     for part in ("cnn", "token_projection", "position_embeddings", "decoder_and_heads"):
         assert b0[part] == b1[part], part
-    assert b0["position_embeddings"] == 2 * 7 * 256
+    assert b0["position_embeddings"] == 2 * 7 * D and b0["token_projection"] == 512 * D + D
     assert "Mamba1Mixer" in m0.encoder.describe_mixer()
     assert "inside every layer" in m0.encoder.describe_mixer()
     assert "GRU" in m1.encoder.describe_mixer()
+
+
+def test_p0_parts_and_the_m0_vs_p0_split():
+    p0 = build("attention")
+    pos = p0.encoder.row.numel() + p0.encoder.col.numel()
+    cnn = count_params(p0.encoder.cnn)
+    assert {
+        "cnn": cnn,
+        "position_embeddings": pos,
+        "decoder_and_heads": P0_PARAMS - cnn - pos,
+    } == P0_PARTS
+    assert sum(P0_PARTS.values()) == P0_PARAMS
+    b0 = make("t3_m0").param_breakdown()
+    assert b0["cnn"] == P0_PARTS["cnn"]
+    # M0 matches P0 in total only: smaller positions and decoder, plus projection and mixer
+    moved = P0_PARTS["position_embeddings"] + P0_PARTS["decoder_and_heads"]
+    moved -= b0["position_embeddings"] + b0["decoder_and_heads"]
+    assert moved == 602_112
+    assert moved - b0["token_projection"] - b0["token_mixer"] == P0_PARAMS - b0["total"]
 
 
 def test_m0_and_m1_share_the_per_layer_fusion_skeleton():
@@ -162,12 +223,12 @@ def test_m0_and_m1_share_the_per_layer_fusion_skeleton():
     for l0, l1 in zip(mx0.layers, mx1.layers, strict=True):
         assert isinstance(l0, BiMambaLayer) and isinstance(l1, BiGRULayer)
         assert l1.rnn.bidirectional and l1.rnn.num_layers == 1
-        assert l0.proj.in_features == 2 * 256 and l0.proj.out_features == 256
-        assert l1.proj.out_features == 256
+        assert l0.proj.in_features == 2 * D and l0.proj.out_features == D
+        assert l1.proj.out_features == D
     # layer 1's output at the first token already depends on the last token (reverse scan),
     # so layer 2's forward mixer reads both directions
     torch.manual_seed(4)
-    t = torch.randn(1, 49, 256)
+    t = torch.randn(1, 49, D)
     t2 = t.clone()
     t2[:, -1] = -t2[:, -1]
     fwd_only = make("t3_m3").encoder.mixer
@@ -179,7 +240,7 @@ def test_m0_and_m1_share_the_per_layer_fusion_skeleton():
     # the old late-fusion design stays available through `fusion: late`
     m0 = CFG["models"]["t3_m0"]["args"]
     late = MambaAttentionGRURecognizer(**(m0 | {"mamba": m0["mamba"] | {"fusion": "late"}}))
-    assert isinstance(late.encoder.mixer, BiMamba) and count_params(late) == 7_816_722
+    assert isinstance(late.encoder.mixer, BiMamba) and count_params(late) == LATE_PARAMS
     assert "late fusion" in late.encoder.describe_mixer()
     with pytest.raises(ValueError, match="fusion"):
         MambaAttentionGRURecognizer(mamba={"fusion": "middle"})
@@ -217,7 +278,7 @@ def test_phase1_build_is_unchanged():
 
 def test_static_selection_is_input_independent():
     m2, m0 = make("t3_m2").eval(), make("t3_m0").eval()
-    u1, u2 = torch.randn(2, 49, 256), torch.randn(2, 49, 256)
+    u1, u2 = torch.randn(2, 49, D), torch.randn(2, 49, D)
     mixers = m2.encoder.mixer.ssm_mixers()  # type: ignore[union-attr]
     assert len(mixers) == 4
     for mixer in mixers:
@@ -245,7 +306,7 @@ def test_forward_only_is_causal_and_bi_is_not():
     assert isinstance(mx3, VisionBiMamba) and mx3.direction == "forward"
     assert not any(hasattr(layer, "bwd") or hasattr(layer, "proj") for layer in mx3.layers)
     torch.manual_seed(3)
-    t = torch.randn(1, 49, 256)
+    t = torch.randn(1, 49, D)
     t2 = t.clone()
     t2[:, 30] += 1.0
     with torch.no_grad():
@@ -262,14 +323,14 @@ def test_forward_only_is_causal_and_bi_is_not():
 def test_position_embedding_removal():
     m0, m4 = make("t3_m0").eval(), make("t3_m4").eval()
     assert m4.encoder.row is None and m4.encoder.col is None
-    assert count_params(m0) - count_params(m4) == 2 * 7 * 256
+    assert count_params(m0) - count_params(m4) == 2 * 7 * D
     missing, unexpected = m4.load_state_dict(m0.state_dict(), strict=False)
     assert not missing and sorted(unexpected) == ["encoder.col", "encoder.row"]
     images = ocr_batch(["12", "3"]).images
     with torch.no_grad():
         t0, t4 = m0.encoder.tokens(images), m4.encoder.tokens(images)
         assert m0.encoder.row is not None and m0.encoder.col is not None
-        pos = (m0.encoder.row[:, None] + m0.encoder.col[None]).reshape(1, 49, 256)
+        pos = (m0.encoder.row[:, None] + m0.encoder.col[None]).reshape(1, 49, D)
         torch.testing.assert_close(t0 - pos, t4)
         assert not torch.allclose(m0.encoder(images), m4.encoder(images))
         m0.encoder.row.zero_()
@@ -315,7 +376,7 @@ def test_onnx_export_greedy_decode_opset17(name, batch, tmp_path):
     """
     if importlib.util.find_spec("onnx") is None:
         pytest.skip("onnx is not installed, torch.onnx.export needs it")
-    model = make(name)
+    model = make(name, seed=10)  # an init whose greedy ids vary between images and steps
     with torch.no_grad():
         # BatchNorm statistics from data (at init the CNN output barely depends on the image)
         # and sharper logits, so the ids vary between images and steps
@@ -396,10 +457,15 @@ def test_run_ocr_smoke(model, cache, tmp_path):
     assert spec["phase"] == "phase2" and spec["teacher_forcing"] == "full"
     pm = spec["param_match"]
     assert pm["t3_p0_cnn_attention_gru_params"] == P0_PARAMS
+    assert pm["t3_p0_parts"] == P0_PARTS
     assert pm["rel_diff_vs_t3_p0"] == pytest.approx(N_PARAMS[model] / P0_PARAMS - 1)
     assert spec["kind"] == CFG["models"][model]["kind"]
-    assert spec["vocabulary"]["size"] == 13 and spec["length_head"].startswith("Linear(256, 5)")
-    assert spec["architecture"]["decoder_token_dim"] == 256
+    assert spec["vocabulary"]["size"] == 13 and spec["length_head"].startswith(f"Linear({D}, 5)")
+    assert spec["architecture"]["decoder_token_dim"] == D
+    assert spec["param_match"]["tolerance"] == PARAM_TOL
+    # compile: true in the config, inactive on CPU, recorded in spec.json and the fingerprint
+    assert spec["compile"]["requested"] is True and spec["compile"]["active"] is False
+    assert json.loads((run / "fingerprint.json").read_text())["compile"] is True
     assert spec["architecture"]["position_embeddings"].startswith("learned row/col")
     assert set(spec["decoding_modes"]) == want
     assert spec["decoding"]["mode"] == dec["mode"] == f"beam{dec['width']}"
@@ -414,6 +480,9 @@ def test_run_ocr_smoke(model, cache, tmp_path):
     ck = (run / "ckpt.pt").read_bytes()
     out = run_ocr(model, cache, tmp_path, ROOT / "configs" / "phase2_task3.yaml", "--eval-only")
     assert "test (beam" in out.stderr and (run / "ckpt.pt").read_bytes() == ck
+    assert "compile: requested but not active on cpu" in out.stderr
+    spec2 = json.loads((run / "spec.json").read_text())
+    assert spec2["eval_only"]["compile"] == spec["compile"]
     again = json.loads((run / "metrics.json").read_text())
     assert {k: v for k, v in again.items() if k != "decoding"} == {
         k: v for k, v in metrics.items() if k != "decoding"
@@ -429,6 +498,110 @@ def test_run_ocr_smoke(model, cache, tmp_path):
     else:
         assert spec["mamba_diagnostics"] is None
         assert "GRU" in spec["architecture"]["token_mixer"]
+
+
+def test_compile_is_off_on_cpu_and_keeps_state_dict_keys():
+    ro = load_run_ocr()
+    for name in ("t3_m0", "t3_m1"):  # Mamba and the BiGRU control are treated alike
+        model = make(name)
+        keys = list(model.state_dict())
+        assert ro.apply_compile(model, CFG, "cpu") == {
+            "requested": True,
+            "active": False,
+            "target": ro.COMPILE_TARGET,
+            "eager_in_mixer": [] if name == "t3_m0" else ["GRU"],
+            "timing_note": ro.COMPILE_TIMING_NOTE,
+        }
+        assert model.encoder.mixer._compiled_call_impl is None  # untouched on CPU
+        assert ro.apply_compile(model, CFG | {"compile": False}, "cuda")["active"] is False
+        assert model.encoder.mixer._compiled_call_impl is None
+        # what a CUDA run does (compilation itself happens lazily at the first call)
+        ro.compile_mixer(model)
+        assert model.encoder.mixer._compiled_call_impl is not None
+        assert list(model.state_dict()) == keys  # no _orig_mod prefix, same ckpt.pt keys
+        fresh = make(name)
+        fresh.load_state_dict(model.state_dict())
+        # a torch.compile(module) wrapper adds _orig_mod., which --eval-only strips
+        wrapped = make(name)
+        wrapped.encoder.mixer = torch.compile(wrapped.encoder.mixer)  # type: ignore[assignment]
+        assert any("_orig_mod." in k for k in wrapped.state_dict())
+        assert list(ro.strip_compile_prefix(wrapped.state_dict())) == keys
+    assert ro.compile_requested({}) is False  # default off (Phase 1 configs)
+    with pytest.raises(SystemExit, match="token-mixer"):
+        ro.apply_compile(build("attention"), CFG, "cpu")
+    assert ro.apply_compile(build("attention"), P1_CFG, "cuda")["active"] is False
+
+
+@pytest.mark.parametrize("name", ["t3_m0", "t3_m1"])
+def test_compiled_mixer_traces_and_matches_eager_on_cpu(name):
+    """Compiles the mixer as a CUDA run does, with the aot_eager backend (no inductor on
+    CPU). Dynamo tracing of the parallel scan and the fp32 region, the backward pass and the
+    force_eager diagnostics must work before the A100 runs."""
+    ro = load_run_ocr()
+    torch._dynamo.reset()
+    eager, model = make(name).eval(), make(name).eval()
+    ro.compile_mixer(model, backend="aot_eager")
+    b = ocr_batch(["12", "345", "6"])
+    with torch.no_grad():
+        torch.testing.assert_close(model.encoder(b.images), eager.encoder(b.images))
+        pred, aux = model.predict(b.images, "beam3")
+        ref_pred, ref_aux = eager.predict(b.images, "beam3")
+        assert pred == ref_pred
+        torch.testing.assert_close(aux["attention"], ref_aux["attention"])
+    counters = torch._dynamo.utils.counters
+    assert counters["stats"]["unique_graphs"] > 0  # the mixer really went through Dynamo
+    rnn_breaks = sum(n for r, n in counters["graph_break"].items() if "GRU" in r)
+    assert (rnn_breaks > 0) == (ro.eager_in_mixer(model) == ["GRU"])  # see COMPILE_TARGET
+    model.train()
+    eager.train()
+    torch.manual_seed(1)  # the same dropout masks in both models
+    loss = model.loss(b)
+    torch.manual_seed(1)
+    ref = eager.loss(b)
+    torch.testing.assert_close(loss, ref)
+    loss.backward()
+    ref.backward()
+    for (k, p), q in zip(model.named_parameters(), eager.parameters()):
+        assert p.grad is not None and torch.isfinite(p.grad).all(), k
+        torch.testing.assert_close(p.grad, q.grad, rtol=1e-4, atol=1e-5)
+    model.eval()
+    with torch.compiler.set_stance("force_eager"):
+        diag = model.mixer_diagnostics(b.images)
+    assert ("dt_mean" in diag) == (name == "t3_m0")
+    torch._dynamo.reset()
+
+
+@pytest.fixture(scope="module")
+def whole_cache(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("svhn_whole")
+    raw = write_raw(tmp / "raw", {"train": 40, "extra": 40, "test": 12})
+    prepare(raw, tmp / "cache", size=64, workers=1)
+    prepare_whole(raw, tmp / "cache", size=64)
+    return tmp / "cache"
+
+
+@pytest.mark.parametrize("setting", ["crop", "whole"])
+def test_run_ocr_smoke_m0_in_both_settings(setting, whole_cache, tmp_path):
+    whole = setting == "whole"
+    model = "t3_m0_whole" if whole else "t3_m0"
+    run_ocr(model, whole_cache, tmp_path, WHOLE_PATH if whole else CFG_PATH)
+    run = tmp_path / "smoke" / "runs" / "task3" / model / "seed0"
+    metrics = json.loads((run / "metrics.json").read_text())
+    spec = json.loads((run / "spec.json").read_text())
+    fp = json.loads((run / "fingerprint.json").read_text())
+    stress = {"test_whole", "test_whole_greedy"}
+    assert (stress <= set(metrics)) is not whole
+    assert spec["setting"] == ("whole_image" if whole else "oracle_crop")
+    assert spec["cache_suffix"] == ("_full" if whole else "")
+    assert spec["crop_protocol"]["stress_split"] == (None if whole else "test_whole")
+    assert fp["data"]["path"].endswith("train_full_images.npy" if whole else "train_images.npy")
+    assert spec["n_params"] == N_PARAMS["t3_m0"] and spec["phase"] == "phase2"
+    assert spec["compile"]["requested"] is True and spec["compile"]["active"] is False
+    assert spec["compile"]["eager_in_mixer"] == []
+    assert fp["compile"] is True and fp["config"]["compile"] is True
+    assert spec["architecture"]["d_model"] == D and (run / "mamba_dt_test.npz").exists()
+    ck = torch.load(run / "ckpt.pt", map_location="cpu", weights_only=False)
+    assert list(ck["best_state"]) == list(make("t3_m0").state_dict())
 
 
 def test_run_ocr_full_run_goes_to_phase2(cache, tmp_path):

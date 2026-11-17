@@ -63,9 +63,26 @@ MAMBA_DEFAULTS = {
     "dropout": 0.0,
 }
 # Trainable parameters of the Phase 1 cnn_attention_gru (T3-P0, configs/phase1_task3.yaml).
-# Plan 2.3 asks for T3-M0 within 5% of it, which the plan's own fixed Mamba settings cannot
-# meet (see configs/phase2_task3.yaml). It is recorded in spec.json for transparency.
+# Plan 2.3 fixes T3-M0 (d_model 128, two bidirectional Mamba-1 layers, d_state 16, d_conv 4,
+# expand 2, 2-D positions) at about this budget, 6,198,546 (-0.07%). T3-M1..M4 are matched
+# to T3-M0 within PARAM_TOL (plan 2.3 and 3.1). See configs/phase2_task3.yaml.
 P0_PARAMS = 6_202_898
+# T3-P0 split. It reads 512-d tokens, so its positions and decoder are larger than in the
+# 128-d T3-M0 (positions 1,792, decoder+heads 911,698). M0 matches P0 in total only.
+P0_PARTS = {
+    "cnn": 4_687_296,
+    "position_embeddings": 7_168,
+    "decoder_and_heads": 1_508_434,
+}
+PARAM_TOL = 0.05
+# d_model of the plan 2.3 T3-M0 and the BiGRU hidden size that matches T3-M1 to it
+D_MODEL = 128
+GRU_HIDDEN = 141
+
+
+def rel_param_diff(n: int, ref: int) -> float:
+    """Relative parameter difference n / ref - 1 (within PARAM_TOL means budget matched)."""
+    return n / ref - 1
 
 
 def _flip(x: torch.Tensor) -> torch.Tensor:
@@ -240,13 +257,13 @@ class MixedTokenEncoder(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 256,
+        d_model: int = D_MODEL,
         mixer: MixerName = "mamba",
         pos_emb: bool = True,
         grid: tuple[int, int] = (7, 7),
         dropout: float = 0.1,
         mamba: dict | None = None,
-        gru_hidden: int = 272,
+        gru_hidden: int = GRU_HIDDEN,
         gru_layers: int = 2,
         gru_direction: Direction = "bi",
         gru_dropout: float = 0.0,
@@ -351,7 +368,7 @@ class MixerAttentionGRURecognizer(GRUDecoderRecognizer):
         emb_dim: int = 64,
         length_loss_weight: float = 0.2,
         dropout: float = 0.1,
-        d_model: int = 256,
+        d_model: int = D_MODEL,
         pos_emb: bool = True,
         **mixer_kw,
     ) -> None:

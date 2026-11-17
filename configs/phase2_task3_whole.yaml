@@ -1,0 +1,85 @@
+# Phase 2 Task 3, Setting B (whole image, no ground-truth box) of docs/experiment_plan.md
+# (Sections 2.3 Phase 2, 3 rows T3-M0..M4, 3.1, 4.4). Companion of configs/phase2_task3.yaml.
+# Models, fit, augmentation, decoding and `compile` are identical to that file. Only the
+# setting keys differ, as between configs/phase1_task3.yaml and phase1_task3_whole.yaml.
+#   cache_suffix "_full": each whole original SVHN image resized to 64x64 (aspect ignored),
+#     no box at train, validation or test (cache from scripts/prepare_svhn_whole.py).
+#   stress_split null: the crop setting's letterbox stress test is not needed here.
+#   model names end in _whole, so runs land in results/phase2/runs/task3/<model>_whole/seed*/
+#     next to the Setting A runs.
+# Parameter counts are the same as in configs/phase2_task3.yaml (the input shape is the same):
+#   t3_m0_whole 6,198,546 (-0.07% vs T3-P0 6,202,898). Controls vs t3_m0_whole:
+#   t3_m1_whole -0.01%, t3_m2_whole -0.01%, t3_m3_whole -1.06%, t3_m4_whole -0.03%.
+#   M0 matches T3-P0 in total only (see the part split in configs/phase2_task3.yaml).
+# compile: true acts as in configs/phase2_task3.yaml. In t3_m1_whole the nn.GRU calls run
+#   eager (Dynamo graph breaks), so train time is not a method comparison.
+title: "Full house-number recognition from whole SVHN images (no ground-truth box)"
+phase: phase2
+seeds: [0, 1, 2]
+results_root: results
+svhn_dir: data/processed/svhn
+size: 64
+crop: 54
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit: {epochs: 16, patience: 16, lr: 3.0e-4, weight_decay: 1.0e-4, clip: 5.0, schedule: step, step_epoch: 10, step_gamma: 0.1, amp: bf16}
+length_loss_weight: 0.2
+color_jitter: 0.3
+cache_suffix: "_full"  # SvhnSplit(svhn_dir, split, suffix="_full")
+stress_split: null     # no letterbox stress test in the whole-image setting
+compile: true  # torch.compile the token mixer on CUDA (no-op on CPU), all models alike
+models:
+  t3_m0_whole:  # proposed: 2 residual bidirectional selective Mamba-1 layers, per-layer fusion
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 128
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}
+  t3_m1_whole:  # matched control: same skeleton, 2 residual 1-layer BiGRU layers, hidden 141
+    kind: gru_mixer_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 128
+      pos_emb: true
+      gru_hidden: 141
+      gru_layers: 2
+      gru_direction: bi
+  t3_m2_whole:  # static-state control: input-independent dt, B, C (capacity kept by an adapter)
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 128
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: true, scan: parallel}
+  t3_m3_whole:  # forward-only raster scan, 4 layers of the unchanged M0 mixer (same mixer count)
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 128
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 4, direction: forward, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}
+  t3_m4_whole:  # t3_m0 without the learned 2-D position embeddings
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 128
+      pos_emb: false
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}

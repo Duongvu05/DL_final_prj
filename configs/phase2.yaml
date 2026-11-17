@@ -8,30 +8,53 @@
 # Run: scripts/run_ts.py --config configs/phase2.yaml --task T --model tT_mK --seed S
 # Outputs go to results/phase2/runs/taskT/tT_mK/seedS (smoke runs to results/smoke/phase2).
 #
+# Budgets (plan Sections 2.1 and 2.2). M0 is sized to the Phase 1 course-main model of the
+# same task. d_inner is set explicitly and overrides expand * d_model. Mamba-2 heads are
+# 32 channels wide.
+#   T1-M0 d_model 96, d_inner 64 (2 heads x 32) per direction, d_state 16, d_conv 4,
+#         2 bidirectional layers, GRU readout 64, attention 128, head 128.
+#   T2-M0 d_model 112, d_inner 32 (1 head x 32), d_state 16, d_conv 4, 2 causal blocks,
+#         Phase 1 LSTM decoder 64, attention 128, horizon embedding 16.
+#
 # Trainable parameter counts (11 input channels, 10 target features). Recompute with
 # `python -m dl_final_prj.ts_mamba configs/phase2.yaml`. M1 enc_hidden and the M3 and M4
 # widths are the values that function's search returns from the M0 args.
-#   task1  t1_m0 327,293 | t1_m1 326,341 (-0.29%) | t1_m2 327,781 (+0.15%)
-#          t1_m3 329,749 (+0.75%) | t1_m4 321,027 (-1.91%)
-#   task2  t2_m0 197,653 | t2_m1 198,049 (+0.20%) | t2_m2 197,897 (+0.12%)
-#          t2_m3 198,881 (+0.62%) | t2_m4 196,385 (-0.64%)
-# Every ablation stays within the 5% tolerance of plan Sections 3 and 3.1.
+#   M0 vs Phase 1 course-main model
+#   task1  t1_m0 175,181 vs bigru_attention 171,925 (+1.89%)
+#   task2  t2_m0 110,023 vs seq2seq_attention 110,033 (-0.01%)
+#   every control vs its M0
+#   task1  t1_m1 176,149 (+0.55%) | t1_m2 175,429 (+0.14%)
+#          t1_m3 175,573 (+0.22%) | t1_m4 168,915 (-3.58%)
+#   task2  t2_m1 110,585 (+0.51%) | t2_m2 107,805 (-2.02%)
+#          t2_m3 110,057 (+0.03%) | t2_m4 113,939 (+3.56%)
+# M0 and every ablation stay within the 5% tolerance of plan Sections 2.1, 2.2, 3 and 3.1
+# by these counts, which equal the effective counts (no idle adapter parameters).
+# M1 keeps the M0 readout or decoder, attention and head and swaps the Mamba encoder for a
+#   BiGRU-2 (task1, hidden 64 per direction, the Phase 1 width) or an LSTM-2 (task2,
+#   hidden 57). Like the Phase 1 models it reads the 11 input channels directly
+#   (input_proj: false). A Linear projection straight before an RNN collapses into the
+#   RNN input weights, so it would count parameters that add no capacity (with it, M1
+#   was nominally +0.11% / +0.59% but effectively about -16.6% / -16.8%).
 # M2 is the full-rank static-state control. A, B and C are learned per head and per state
-#   (16 decay modes per head), only their input dependence is removed.
-# M3 keeps the 6 Mamba-2 heads and widens each head from 32 to 33 channels (d_inner 198).
-#   Without that compensation d_conv=1 gives -1.37% (task1) and -1.13% (task2).
-# M4 keeps 32 channels per head and adds heads. T1-M4 (forward only) uses 13 heads
-#   (d_inner 416), close to the 2 x 6 heads per layer of the bidirectional M0. T2-M4 (no
-#   decoder attention) uses 8 heads (d_inner 256). Unwidened they were -42.6% and -19.9%.
-#
-# PLAN DEVIATION, budget against Phase 1 (plan 2.1 asks for M0 within 5% of the Phase 1
-# GRU count). The plan also fixes d_model=96 and expand=2, and both cannot hold together.
-# This config keeps d_model=96 and expand=2, so M0 is larger than the Phase 1 course-main
-# models. T1-M0 327,293 vs bigru_attention 171,925 (1.90x). T2-M0 197,653 vs
-# seq2seq_attention 110,033 (1.80x). The Mamba claims rest on the matched M0-M1 and M0-M2
-# contrasts. A Phase 2 vs Phase 1 comparison must state this size gap and is not a matched
-# comparison. A budget-matched alternative would be d_inner 64 (2 heads x 32) for task1,
-# about +1.9% vs Phase 1, which needs the lead's decision.
+#   (16 decay modes per head), only their input dependence is removed. Its residual
+#   adapter x + up(down(x)) on the SSM input replaces the removed selection parameters.
+#   The adapter rank is capped at d_inner // 2 (mamba.static_adapter_rank), because a
+#   linear d -> r -> d map with r >= d is just one d x d map and would count idle parameters.
+#   T1-M2 is not affected (rank 26 at d_inner 64). For T2-M2 the cap binds at d_inner 32, so
+#   T2-M2 compensates with one wider head of 36 channels (d_inner 36): 107,805, -2.02%.
+# M3 keeps the Mamba-2 heads of M0 and widens each head from 32 to 33 channels (task1
+#   2 heads, d_inner 66, task2 1 head, d_inner 33). Without that compensation d_conv=1
+#   gives -1.10% (task1) and -0.58% (task2).
+# M4 keeps 32 channels per head and adds whole heads. T1-M4 (forward only) uses 5 heads
+#   (d_inner 160), close to the 2 x 2 heads per layer of the bidirectional M0. T2-M4 (no
+#   decoder attention) uses 3 heads (d_inner 96). Unwidened they were -36.14% and -36.65%.
+#   One head is the smallest step here (about 19k and 22k parameters), so M4 is the
+#   least tightly matched control, but both stay inside 5%.
+#   Caveat for T2-M4. All parameters that attention=False removes sit in the decoder, but
+#   the head-count rule puts them back in the encoder, which becomes 3x wider (3 heads vs
+#   1). M0 vs T2-M4 therefore changes attention and encoder width together and cannot be
+#   put down to attention alone. The decoder-side alternative keeps the M0 encoder and
+#   widens the decoder LSTM to hidden 104 (110,303, +0.25%).
 phase: phase2
 seeds: [0, 1, 2]
 results_root: results
@@ -48,19 +71,19 @@ task1:
   models:
     t1_m0:   # seasonal-residual Mamba-2-GRU hybrid with attention (proposed)
       kind: mamba_gru
-      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
-    t1_m1:   # matched control: input projection + BiGRU-2 (hidden 89) + same readout/attention/head
+      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 64, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
+    t1_m1:   # matched control: BiGRU-2 (hidden 64) on the raw inputs + same readout/attention/head
       kind: mamba_gru
-      args: {encoder: bigru, d_model: 96, n_layers: 2, enc_hidden: 89, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
+      args: {encoder: bigru, input_proj: false, n_layers: 2, enc_hidden: 64, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
     t1_m2:   # static-state control, input-independent dt/B/C
       kind: mamba_gru
-      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, static: true, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
-    t1_m3:   # no depthwise conv (d_conv=1), compensating width 6 heads x 33
+      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 64, static: true, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
+    t1_m3:   # no depthwise conv (d_conv=1), compensating width 2 heads x 33
       kind: mamba_gru
-      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 1, expand: 2, ssm_head_dim: 33, d_inner: 198, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
-    t1_m4:   # forward-only scan, compensating width 13 heads x 32
+      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: bi, d_state: 16, d_conv: 1, expand: 2, ssm_head_dim: 33, d_inner: 66, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
+    t1_m4:   # forward-only scan, compensating width 5 heads x 32
       kind: mamba_gru
-      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: forward, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 416, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
+      args: {encoder: mamba, d_model: 96, n_layers: 2, direction: forward, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 160, static: false, readout_hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128}
 
 task2:
   title: "Five-hour-ahead sequence forecasting of MT_235 electricity load"
@@ -74,16 +97,16 @@ task2:
   models:
     t2_m0:   # causal Mamba-2 encoder + Phase 1 attentive LSTM decoder (proposed)
       kind: mamba_seq2seq
-      args: {encoder: mamba, d_model: 96, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, static: false, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
-    t2_m1:   # matched control: input projection + LSTM-2 encoder (hidden 86) + identical decoder
+      args: {encoder: mamba, d_model: 112, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 32, static: false, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
+    t2_m1:   # matched control: LSTM-2 encoder (hidden 57) on the raw inputs + identical decoder
       kind: mamba_seq2seq
-      args: {encoder: lstm, d_model: 96, n_layers: 2, enc_hidden: 86, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
+      args: {encoder: lstm, input_proj: false, n_layers: 2, enc_hidden: 57, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
     t2_m2:   # static-state control, input-independent dt/B/C
       kind: mamba_seq2seq
-      args: {encoder: mamba, d_model: 96, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, static: true, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
-    t2_m3:   # no depthwise conv (d_conv=1), compensating width 6 heads x 33
+      args: {encoder: mamba, d_model: 112, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 36, d_inner: 36, static: true, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
+    t2_m3:   # no depthwise conv (d_conv=1), compensating width 1 head x 33
       kind: mamba_seq2seq
-      args: {encoder: mamba, d_model: 96, n_layers: 2, d_state: 16, d_conv: 1, expand: 2, ssm_head_dim: 33, d_inner: 198, static: false, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
-    t2_m4:   # M0 without decoder attention, compensating width 8 heads x 32
+      args: {encoder: mamba, d_model: 112, n_layers: 2, d_state: 16, d_conv: 1, expand: 2, ssm_head_dim: 33, d_inner: 33, static: false, hidden: 64, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
+    t2_m4:   # M0 without decoder attention, compensating width 3 heads x 32
       kind: mamba_seq2seq
-      args: {encoder: mamba, d_model: 96, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 256, static: false, hidden: 64, dropout: 0.2, attention: false, horizon_dim: 16}
+      args: {encoder: mamba, d_model: 112, n_layers: 2, d_state: 16, d_conv: 4, expand: 2, ssm_head_dim: 32, d_inner: 96, static: false, hidden: 64, dropout: 0.2, attention: false, horizon_dim: 16}
