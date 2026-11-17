@@ -19,7 +19,8 @@ from dl_final_prj.fast import parse_semicolon_table
 
 TARGET = "MT_235"
 CALENDAR = ("hour_sin", "hour_cos", "dow_sin", "dow_cos")
-RIDGE_LAGS = (1, 2, 3, 24, 48, 168)
+RECENT_LAGS = (1, 2, 3)  # counted back from the origin t: y[t], y[t-1], y[t-2]
+SEASONAL_LAGS = (24, 48, 168)  # counted back from the target hour t+h
 URL = "https://archive.ics.uci.edu/dataset/321/electricityloaddiagrams20112014"
 
 
@@ -229,6 +230,15 @@ class ElectricityData:
 def ridge_design(
     y_raw: np.ndarray, cal: np.ndarray, origins: np.ndarray, offset: int
 ) -> np.ndarray:
-    """Ridge features for target t+offset. Lag k means y[t+1-k], so lag 1 is the last observation."""
-    lags = np.column_stack([y_raw[origins + 1 - k] for k in RIDGE_LAGS])
-    return np.hstack([lags, cal[origins + offset]])
+    """Ridge features for the target hour t+offset.
+
+    Recent lags k in {1, 2, 3} are y[t+1-k] (the last three observations). Seasonal lags
+    k in {24, 48, 168} are aligned to the target hour, y[t+offset-k], i.e. the same hour one
+    day, two days and one week earlier. These are observed at time t because offset <= 5 < 24.
+    Plus the calendar features of the target hour.
+    """
+    if offset >= min(SEASONAL_LAGS):
+        raise ValueError("seasonal lags would need unobserved values")
+    recent = [y_raw[origins + 1 - k] for k in RECENT_LAGS]
+    seasonal = [y_raw[origins + offset - k] for k in SEASONAL_LAGS]
+    return np.hstack([np.column_stack(recent + seasonal), cal[origins + offset]])

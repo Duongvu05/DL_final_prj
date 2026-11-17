@@ -63,8 +63,9 @@ def main() -> None:
             }
             if name == "ridge":
                 spec["ridge"] = ridge_log | {
-                    "lags": [1, 2, 3, 24, 48, 168],
-                    "features": "target lags + target-hour calendar",
+                    "recent_lags_from_origin": [1, 2, 3],
+                    "seasonal_lags_from_target_hour": [24, 48, 168],
+                    "features": "y[t], y[t-1], y[t-2], y[t+h-24], y[t+h-48], y[t+h-168], target-hour calendar",
                 }
                 spec["n_params"] = len(data.offsets) * (6 + 4 + 1)
             write_json(spec, run_dir / "spec.json")

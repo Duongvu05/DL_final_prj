@@ -151,3 +151,19 @@ def test_prepare_from_raw_ld_file(tmp_path):
     z = np.load(tmp_path / "proc" / "electricity_hourly.npz")
     np.testing.assert_allclose(z["values"][0], vals[:4].mean(0), rtol=1e-6)
     assert pd.DatetimeIndex(z["hours"])[-1] == pd.Timestamp(stamps[-1])
+
+
+def test_ridge_seasonal_lags_are_aligned_to_the_target_hour(synthetic_npz):
+    from dl_final_prj.electricity import calendar_features, ridge_design
+
+    d = ElectricityData(synthetic_npz, 168, (1, 2, 3, 4, 5))
+    o = d.origins["test"][:10]
+    cal = calendar_features(d.hours)
+    for h in d.offsets:
+        x = ridge_design(d.y_raw, cal, o, h)
+        np.testing.assert_allclose(
+            x[:, :3], np.column_stack([d.y_raw[o], d.y_raw[o - 1], d.y_raw[o - 2]])
+        )
+        np.testing.assert_allclose(x[:, 3], d.y_raw[o + h - 24])  # same hour yesterday
+        np.testing.assert_allclose(x[:, 5], d.y_raw[o + h - 168])  # same hour last week
+        assert (o + h - 24 <= o).all()  # only observed values

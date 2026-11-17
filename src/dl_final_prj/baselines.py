@@ -31,7 +31,8 @@ def _apply(x: np.ndarray, w: np.ndarray) -> np.ndarray:
 
 
 def ridge_predictions(data: ElectricityData) -> tuple[dict[str, np.ndarray], dict]:
-    """Direct ridge per horizon on lags {1,2,3,24,48,168} of the target plus target-hour calendar.
+    """Direct ridge per horizon on the last 3 target values, the target-hour values 24/48/168 h
+    earlier and the target-hour calendar (see electricity.ridge_design).
 
     Features are standardized with train statistics. One alpha is chosen for all horizons by
     the pooled validation RMSE. Returns predictions for val and test and the selection log.
