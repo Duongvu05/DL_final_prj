@@ -220,14 +220,43 @@ def ocr_tables(root: Path, runs: dict) -> None:
                      "n_params": spec["n_params"], "epochs_run": spec["epochs_run"],
                      "best_epoch": spec["best_epoch"], "train_seconds": spec["train_seconds"]}
                 )  # fmt: skip
+            rows += rescoring_rows(d, model, seed, spec)
     df = pd.DataFrame(rows)
     df.to_csv(root / "task3_metrics_by_seed.csv", index=False)
     parts = []
-    for split in [x for x in OCR_MODES if x != "val" and x in set(df.split)]:
+    test_splits = [x for x in dict.fromkeys(df.split) if x.startswith("test")]
+    for split in test_splits:
         sm = summarize(df[df.split == split], [*OCR_METRICS, "n_params", "train_seconds"])
         sm["setting"] = sm.model.map(setting_of)
         parts.append(sm.assign(split=split))
     pd.concat(parts).to_csv(root / "task3_metrics_summary.csv", index=False)
+
+
+def rescoring_rows(d: Path, model: str, seed: int, spec: dict) -> list[dict]:
+    """Rows from scripts/rescore_task3.py (GRU decoders). beam_primary uses the setting-level
+    width (mean validation exact match over seeds 0-2), the plan's reported primary decoding;
+    the secondary methods rerank that n-best list with setting-level lambdas."""
+    f = d / "rescoring.json"
+    if not f.exists():
+        return []
+    rs = json.loads(f.read_text())
+    rows = []
+    for name, m in rs["methods"].items():
+        for split in ("val", "test"):
+            if not isinstance(m.get(split), dict):
+                continue
+            hp = m.get("hyperparameter") or {}
+            rows.append(
+                {"model": model, "family": family_of(model), "setting": setting_of(model),
+                 "seed": seed, "split": f"{split}_{m.get('plan_name', name)}", "decoding": name,
+                 "width": rs["nbest"].get("primary_width"),
+                 "lambda": hp.get("value") if isinstance(hp, dict) else None,
+                 "plan_conformant": rs.get("plan_conformant"),
+                 **{k: m[split][k] for k in OCR_METRICS},
+                 "n_params": spec["n_params"], "epochs_run": spec["epochs_run"],
+                 "best_epoch": spec["best_epoch"], "train_seconds": spec["train_seconds"]}
+            )  # fmt: skip
+    return rows
 
 
 def model_specs(root: Path, task: int, runs: dict) -> None:
