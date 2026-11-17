@@ -1,2 +1,1 @@
-def hello() -> str:
-    return "Hello from DL_final_prj!"
+"""Group 12 DL final project. Electricity load forecasting (Tasks 1-2) and SVHN reading (Task 3)."""

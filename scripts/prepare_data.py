@@ -1,0 +1,105 @@
+"""Phase 0. Parse the raw UCI and SVHN files once, freeze splits, write the manifests.
+
+Writes data/processed/{electricity_hourly.npz, electricity_audit.json, svhn/*} and
+results/manifests/{dataset_manifest.json, split_manifest.json, environment.json, checksums.txt}.
+"""
+
+import argparse
+import hashlib
+import json
+import platform
+import subprocess
+import time
+from pathlib import Path
+
+import torch
+import yaml
+from loguru import logger
+
+from dl_final_prj import electricity, svhn
+from dl_final_prj.electricity import ElectricityData
+from dl_final_prj.engine import write_json
+from dl_final_prj.fast import has_rust
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--raw", default="data/raw")
+    ap.add_argument("--processed", default="data/processed")
+    ap.add_argument("--config", default="configs/phase1.yaml")
+    ap.add_argument("--skip", choices=("electricity", "svhn"), action="append", default=[])
+    a = ap.parse_args()
+    cfg = yaml.safe_load(Path(a.config).read_text())
+    raw, proc = Path(a.raw), Path(a.processed)
+    man = Path(cfg["results_root"]) / "manifests"
+    man.mkdir(parents=True, exist_ok=True)
+
+    if "electricity" not in a.skip:
+        t0 = time.time()
+        audit = electricity.prepare(raw / "uci_electricity" / "LD2011_2014.txt", proc)
+        logger.info(
+            f"electricity prepared in {time.time() - t0:.1f}s, {audit['n_stable_clients']} stable clients"
+        )
+    if "svhn" not in a.skip:
+        t0 = time.time()
+        audit = svhn.prepare(
+            raw / "svhn", proc / "svhn", cfg["task3"]["height"], cfg["task3"]["width"]
+        )
+        logger.info(f"svhn cached in {time.time() - t0:.1f}s: {audit['splits']}")
+
+    e_audit = json.loads((proc / "electricity_audit.json").read_text())
+    s_audit = json.loads((proc / "svhn" / "svhn_audit.json").read_text())
+    write_json({"electricity": e_audit, "svhn": s_audit}, man / "dataset_manifest.json")
+
+    splits = {"task3": {k: v for k, v in s_audit["splits"].items()}}
+    npz = proc / "electricity_hourly.npz"
+    for t in (1, 2):
+        tc = cfg[f"task{t}"]
+        d = ElectricityData(npz, tc["lookback"], tuple(tc["offsets"]))
+        n_all = d.n - tc["lookback"] - max(tc["offsets"]) + 1
+        splits[f"task{t}"] = {
+            "lookback": tc["lookback"],
+            "offsets": tc["offsets"],
+            "formula_all_windows": f"N - L - {max(tc['offsets'])} + 1 = {d.n} - {tc['lookback']} - {max(tc['offsets'])} + 1 = {n_all}",
+            "rule": "origin assigned to the split containing all its target hours, inputs may cross the boundary",
+            "splits": d.split_summary(),
+        }
+    write_json(splits, man / "split_manifest.json")
+
+    sums = []
+    for p in sorted(
+        list((raw / "uci_electricity").glob("*.zip")) + list((raw / "svhn").glob("*.tar.gz"))
+    ):
+        sums.append(f"{sha256(p)}  {p.name}")
+    (man / "checksums.txt").write_text("\n".join(sums) + "\n")
+
+    env = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "rust_extension": has_rust(),
+        "git_commit": git_commit(),
+        "host": platform.node(),
+    }
+    write_json(env, man / "environment.json")
+    logger.info(f"manifests written to {man}")
+
+
+if __name__ == "__main__":
+    main()

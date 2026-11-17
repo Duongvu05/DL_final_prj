@@ -1,4 +1,0 @@
-Source: https://github.com/thuml/Time-Series-Library
-Commit: 4e938a1767106324dd753b2a44832bf870a0252e
-License: MIT (see LICENSE)
-Adapted files: src/dl_final_prj/models/sota_forecasters/{layers,patchtst,itransformer}.py

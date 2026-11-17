@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dlfast"
+version = "0.1.0"
+description = "Rust hot paths for the DL final project"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
