@@ -31,9 +31,9 @@ from dl_final_prj.ts_models import BiRNNForecaster, Seq2SeqForecaster, count_par
 def build_model(kind: str, args: dict, data: ElectricityData) -> torch.nn.Module:
     common = {"horizon": data.horizon, "n_target_feats": data.n_target_feats}
     if kind == "birnn":
-        return BiRNNForecaster(data.n_features, **common, **args)
+        return BiRNNForecaster(data.n_features, **common, lookback=data.lookback, **args)
     if kind == "seq2seq":
-        return Seq2SeqForecaster(data.n_features, **common, **args)
+        return Seq2SeqForecaster(data.n_features, **common, lookback=data.lookback, **args)
     # Phase 2 models are imported lazily, so Phase 1 jobs never depend on the Mamba modules
     if kind == "mamba_gru":  # Phase 2, Task 1
         from dl_final_prj.ts_mamba import MambaGRUForecaster

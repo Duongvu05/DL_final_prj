@@ -41,6 +41,11 @@ class BiRNNForecaster(nn.Module):
     attention, a Bahdanau MLP scores all encoder outputs with the final state as query. The
     head sees [final, context (if attention), target features of every horizon flattened] and
     is LayerNorm -> Linear(head_dim) -> GELU -> Dropout -> Linear(H) standardized residuals.
+
+    With linear_skip=True a linear highway (the AR component of LSTNet, Lai et al. 2018) maps
+    the standardized target window x[:, :, 0] and the flattened target features straight to the
+    H outputs and is added to the network output. The two parts are trained jointly, so the
+    network only has to learn a nonlinear correction on top of a full-window linear model.
     """
 
     def __init__(
@@ -55,6 +60,8 @@ class BiRNNForecaster(nn.Module):
         attn_dim: int = 128,
         head_dim: int = 128,
         cell: str = "gru",
+        linear_skip: bool = False,
+        lookback: int = 168,
     ) -> None:
         super().__init__()
         rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell]
@@ -72,6 +79,7 @@ class BiRNNForecaster(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(head_dim, horizon),
         )
+        self.skip = nn.Linear(lookback + horizon * n_target_feats, horizon) if linear_skip else None
 
     def forward(self, b: Batch, teacher_forcing: float = 0.0):
         out, h = self.rnn(b.x)
@@ -84,7 +92,10 @@ class BiRNNForecaster(nn.Module):
             parts.append(ctx)
             aux["attention"] = w
         parts.append(b.target_feats.flatten(1))
-        return self.head(torch.cat(parts, dim=-1)), aux
+        pred = self.head(torch.cat(parts, dim=-1))
+        if self.skip is not None:
+            pred = pred + self.skip(torch.cat([b.x[:, :, 0], b.target_feats.flatten(1)], dim=-1))
+        return pred, aux
 
 
 class Seq2SeqForecaster(nn.Module):
@@ -99,6 +110,11 @@ class Seq2SeqForecaster(nn.Module):
     In training mode the previous residual is the true one from Batch.y with probability
     `teacher_forcing` (1.0 in Phase 1). In eval mode decoding is fully autoregressive whatever
     the ratio argument.
+
+    With linear_skip=True a linear highway (the AR component of LSTNet, Lai et al. 2018) maps
+    the standardized target window x[:, :, 0] and the flattened target features straight to the
+    H outputs and is added to the decoder output of each step. The two parts are trained jointly, so the
+    network only has to learn a nonlinear correction on top of a full-window linear model.
     """
 
     def __init__(
@@ -112,6 +128,8 @@ class Seq2SeqForecaster(nn.Module):
         attention: bool = True,
         attn_dim: int = 128,
         horizon_dim: int = 16,
+        linear_skip: bool = False,
+        lookback: int = 168,
     ) -> None:
         super().__init__()
         self.horizon = horizon
@@ -122,6 +140,7 @@ class Seq2SeqForecaster(nn.Module):
         self.decoder = nn.LSTMCell(dec_in, hidden)
         self.drop = nn.Dropout(dropout)
         self.out = nn.Linear(hidden * (2 if attention else 1), 1)
+        self.skip = nn.Linear(lookback + horizon * n_target_feats, horizon) if linear_skip else None
 
     def forward(self, b: Batch, teacher_forcing: float = 0.0):
         enc, (h_n, c_n) = self.encoder(b.x)
@@ -131,6 +150,9 @@ class Seq2SeqForecaster(nn.Module):
         preds, weights = [], []
         bsz = b.x.shape[0]
         tf = teacher_forcing if self.training else 0.0
+        skip = None
+        if self.skip is not None:
+            skip = self.skip(torch.cat([b.x[:, :, 0], b.target_feats.flatten(1)], dim=-1))
         for k in range(self.horizon):
             emb = self.h_emb.weight[k].expand(bsz, -1)
             parts = [prev, b.target_feats[:, k], emb]
@@ -142,6 +164,8 @@ class Seq2SeqForecaster(nn.Module):
             h, c = self.decoder(torch.cat(parts, dim=-1), (h, c))
             feat = self.drop(h if ctx is None else torch.cat([h, ctx], dim=-1))
             pred = self.out(feat)
+            if skip is not None:
+                pred = pred + skip[:, k : k + 1]
             preds.append(pred)
             true = b.y[:, k : k + 1]
             if tf >= 1.0:

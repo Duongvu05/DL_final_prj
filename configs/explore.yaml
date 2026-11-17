@@ -1,0 +1,94 @@
+# Exploration requested by the user on 2026-11-17: Phase 1 best models plus a jointly trained
+# full-window linear highway (LSTNet AR component). Same data and fit as configs/phase1.yaml.
+seeds:
+- 0
+- 1
+- 2
+results_root: results
+electricity_npz: data/processed/electricity_hourly.npz
+svhn_dir: data/processed/svhn
+task1:
+  title: Two-hour-ahead forecasting of MT_235 electricity load
+  lookback: 168
+  offsets:
+  - 2
+  target_only: true
+  batch_size: 256
+  eval_batch_size: 2048
+  fit:
+    epochs: 50
+    patience: 8
+    lr: 0.0005
+    weight_decay: 0.0001
+    clip: 1.0
+    schedule: plateau
+    plateau_patience: 3
+    plateau_factor: 0.5
+  models:
+    bigru_skip:
+      kind: birnn
+      args:
+        hidden: 64
+        layers: 2
+        dropout: 0.2
+        attention: false
+        head_dim: 128
+        cell: gru
+        linear_skip: true
+    bigru_attention_skip:
+      kind: birnn
+      args:
+        hidden: 64
+        layers: 2
+        dropout: 0.2
+        attention: true
+        attn_dim: 128
+        head_dim: 128
+        cell: gru
+        linear_skip: true
+task2:
+  title: Five-hour-ahead sequence forecasting of MT_235 electricity load
+  lookback: 168
+  offsets:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  target_only: true
+  batch_size: 128
+  eval_batch_size: 2048
+  fit:
+    epochs: 60
+    patience: 10
+    lr: 0.0005
+    weight_decay: 0.0001
+    clip: 1.0
+    schedule: plateau
+    plateau_patience: 3
+    plateau_factor: 0.5
+  teacher_forcing:
+    start: 1.0
+    end: 1.0
+    decay_epochs: 1
+  models:
+    seq2seq_skip:
+      kind: seq2seq
+      args:
+        hidden: 64
+        enc_layers: 2
+        dropout: 0.2
+        attention: false
+        horizon_dim: 16
+        linear_skip: true
+    seq2seq_attention_skip:
+      kind: seq2seq
+      args:
+        hidden: 64
+        enc_layers: 2
+        dropout: 0.2
+        attention: true
+        attn_dim: 128
+        horizon_dim: 16
+        linear_skip: true
+phase: explore

@@ -460,3 +460,21 @@ def test_smoke_end_to_end(synthetic_npz, tmp_path, task, model):
     mtime = (run / "metrics.json").stat().st_mtime_ns
     _run("run_ts.py", *common, "--model", model, "--seed", "0")
     assert (run / "metrics.json").stat().st_mtime_ns == mtime
+
+
+def test_linear_skip_is_optional_and_adds_a_window_linear_path(synthetic_npz):
+    for offsets, cls in (((2,), BiRNNForecaster), ((1, 2, 3, 4, 5), Seq2SeqForecaster)):
+        d = ElectricityData(synthetic_npz, 168, offsets)
+        b = d.batch(torch.as_tensor(d.origins["val"][:4]))
+        kw = {"horizon": d.horizon, "n_target_feats": d.n_target_feats, "hidden": 8}
+        base = cls(d.n_features, **kw).eval()
+        torch.manual_seed(0)
+        skip = cls(d.n_features, **kw, linear_skip=True, lookback=168).eval()
+        assert base.skip is None and skip.skip is not None
+        with torch.no_grad():
+            p, _ = skip(b)
+            skip.skip.weight.zero_()
+            skip.skip.bias.zero_()
+            p0, _ = skip(b)
+        assert p.shape == p0.shape == (4, d.horizon)
+        assert not torch.allclose(p, p0)  # the highway contributes to the output
