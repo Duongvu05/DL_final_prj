@@ -1,0 +1,36 @@
+# Phase 1 Task 3, whole-image setting (He et al. 2019 style). Companion of phase1_task3.yaml.
+# No ground-truth box is used for training, validation or test. Each WHOLE original SVHN
+# image is resized to 64x64 with the aspect ratio ignored (stretch), with no crop. The
+# images, their order and the train/val/test split are the same as in the cropped cache,
+# so the two settings differ only in localization (oracle GT-box crop vs none).
+# Build the cache with scripts/prepare_svhn_whole.py (files {split}_full_* in svhn_dir).
+# Everything else (models, fit, augmentation, decoding) is identical to phase1_task3.yaml.
+# Runs land in results/phase1/runs/task3/<model>_whole/seed*/ next to the cropped runs.
+title: "Full house-number recognition from whole SVHN images (no ground-truth box)"
+seeds: [0, 1, 2]
+results_root: results
+svhn_dir: data/processed/svhn
+cache_suffix: "_full"  # SvhnSplit(svhn_dir, split, suffix="_full")
+stress_split: null     # the letterbox stress test of the cropped setting is not needed here
+size: 64
+crop: 54
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit: {epochs: 16, patience: 16, lr: 3.0e-4, weight_decay: 1.0e-4, clip: 5.0, schedule: step, step_epoch: 10, step_gamma: 0.1, amp: bf16}
+length_loss_weight: 0.2
+color_jitter: 0.3
+models:
+  cnn_attention_gru_whole:  # course model: VGG-BN CNN + 2-D positions + Bahdanau attention 2-layer GRU (T3-P0)
+    kind: attention
+    args: {hidden: 256, layers: 2, attn_dim: 256, emb_dim: 64}
+  cnn_pool_gru_whole:       # same CNN and GRU decoder, mean token instead of attention (T3-P1)
+    kind: pooled
+    args: {hidden: 256, layers: 2, emb_dim: 64}
+  multihead_cnn_whole:      # Goodfellow-style length + 5 digit heads (T3-P2)
+    kind: multihead
+    args: {fc_dim: 1024, dropout: 0.3}
+  crnn_ctc_whole:           # CRNN: (2,1) last pooling, 14 steps, BiLSTM, CTC (T3-P3)
+    kind: ctc
+    args: {hidden: 256, layers: 2}

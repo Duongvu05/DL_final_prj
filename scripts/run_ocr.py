@@ -1,8 +1,25 @@
-"""Train (or resume) one Task 3 recognizer on cropped SVHN for one seed, then evaluate it.
+"""Train (or resume) one Task 3 recognizer on cached SVHN for one seed, then evaluate it.
 
-Selection is early stopping on validation exact-match (greedy). The restored best checkpoint
-is evaluated on val, test (primary, oracle GT-box crop), test_length_constrained and
-test_beam3 (GRU decoders only) and test_whole (whole-image letterbox stress test).
+Settings. configs/phase1_task3.yaml and phase2_task3.yaml use the oracle GT-box crop cache.
+configs/phase1_task3_whole.yaml sets `cache_suffix: "_full"` (whole images, no ground-truth
+box at train, validation or test) and `stress_split: null`. `stress_split` (default
+"test_whole") names an extra cached split evaluated with the same checkpoint (the
+whole-image letterbox stress test of the crop setting). It is read without the suffix.
+
+Checkpoint selection (training time) is early stopping on validation exact match with
+greedy decoding. It is kept because re-selecting would need retraining.
+
+Reported decoding is never greedy (ocr_models.PRIMARY_DECODING): beam search for the GRU
+decoders, CTC prefix beam search for CRNN-CTC, exact MAP for the multi-head CNN. The width W
+is chosen on the validation split from BEAM_WIDTHS by exact match (ties to the smaller W)
+and then used for test and the stress split. metrics.json keys: val, test (primary),
+val_greedy, test_greedy (diagnostic), test_length_constrained (GRU decoders, diagnostic),
+<stress>, <stress>_greedy and "decoding" (primary, width, val_by_width).
+
+--eval-only reloads ckpt.pt's best_state of a finished run (no training, ckpt.pt and
+fingerprint.json untouched), backs metrics.json up once as metrics_v1_greedy.json when it
+predates this decoding, and rewrites metrics.json, the pred_*.json files, attention_test.npz
+and spec.json's decoding entries.
 
 Phase 2 (configs/phase2_task3.yaml, `phase: phase2`) adds the token-mixer kinds of
 ocr_mamba. Their runs go to results/phase2/... and Mamba runs also save the mean dt per
@@ -12,6 +29,7 @@ visual token on the test set (mamba_dt_test.npz).
 import argparse
 import json
 import math
+import shutil
 import time
 from pathlib import Path
 
@@ -31,27 +49,31 @@ from dl_final_prj.engine import (
 )
 from dl_final_prj.metrics import sequence_report
 from dl_final_prj.ocr_mamba import P0_PARAMS, MixerAttentionGRURecognizer
-from dl_final_prj.ocr_models import build
+from dl_final_prj.ocr_models import (
+    DECODING_TEXT,
+    PRIMARY_DECODING,
+    build,
+    decoder_family,
+    primary_mode,
+    search_widths,
+    select_width,
+)
 from dl_final_prj.svhn import DIGIT0, EOS, PAD, SOS, VOCAB, OcrBatch, SvhnSplit, encode
 from dl_final_prj.ts_models import count_params
 
 MIXER_KINDS = ("mamba_attention", "gru_mixer_attention")  # Phase 2, ocr_mamba
 GRU_DECODER_KINDS = ("attention", "pooled", *MIXER_KINDS)
 ATTENTION_KINDS = ("attention", *MIXER_KINDS)
-SMOKE_SIZES = {"train": 2000, "val": 500, "test": 500, "test_whole": 500}
-# metrics.json key -> (cached split, decoding mode)
-EVALS = {
-    "val": ("val", "greedy"),
-    "test": ("test", "greedy"),
-    "test_length_constrained": ("test", "length"),
-    "test_beam3": ("test", "beam3"),
-    "test_whole": ("test_whole", "greedy"),
-}
-MODE_TEXT = {
-    "greedy": "greedy, unconstrained (primary)",
-    "length": "greedy, constrained to the length-head prediction",
-    "beam3": "beam search width 3, unconstrained, score / number of tokens",
-}
+SMOKE_SIZES = {"train": 2000, "val": 500, "test": 500}
+SMOKE_STRESS = 500
+TRAINING_SELECTION = (
+    "early stopping on validation exact-match with greedy decoding (training-time checkpoint "
+    "selection rule, kept for the non-greedy evaluation because re-selecting needs retraining)"
+)
+WIDTH_SELECTION = (
+    "validation exact match, ties to the smaller width, chosen before any test evaluation "
+    "and reused for test and the stress split"
+)
 
 
 @torch.no_grad()
@@ -66,6 +88,135 @@ def predict(model, split: SvhnSplit, mode: str, bs: int, amp: bool, keep_attenti
         if keep_attention and "attention" in aux:
             attn.append(aux["attention"].float().cpu().numpy().astype(np.float16))
     return preds, (np.concatenate(attn) if attn else None)
+
+
+def report(split: SvhnSplit, preds: list[str]) -> dict:
+    return sequence_report(split.labels, preds)
+
+
+def evaluate(
+    model, data: dict[str, SvhnSplit], stress: str | None, bs: int, amp: bool, keep_attention: bool
+):
+    """All Task 3 evaluations of a trained model. The width is selected on data["val"] only,
+    before data["test"] is touched. Returns (metrics, predictions by metrics key, attention
+    arrays for attention_test.npz or None)."""
+    fam = decoder_family(model)
+    widths = search_widths(model)
+    t0 = time.time()
+    val_by_width: dict[str, float] = {}
+    if widths:
+        val_preds = {}
+        for w in widths:
+            val_preds[w], _ = predict(model, data["val"], primary_mode(model, w), bs, amp)
+            val_by_width[str(w)] = report(data["val"], val_preds[w])["exact_match"]
+            logger.info(f"val {primary_mode(model, w)} exact {val_by_width[str(w)]:.4f}")
+        width: int | None = select_width({w: val_by_width[str(w)] for w in widths})
+        val_primary = val_preds[width]
+    else:
+        width = None
+        val_primary, _ = predict(model, data["val"], primary_mode(model, None), bs, amp)
+    mode = primary_mode(model, width)
+    preds: dict[str, list[str]] = {"val": val_primary}
+    preds["val_greedy"], _ = predict(model, data["val"], "greedy", bs, amp)
+    # test is only read from here on, with the width fixed above
+    preds["test"], att = predict(model, data["test"], mode, bs, amp, keep_attention)
+    preds["test_greedy"], att_greedy = predict(
+        model, data["test"], "greedy", bs, amp, keep_attention
+    )
+    if fam == "gru":
+        preds["test_length_constrained"], _ = predict(model, data["test"], "length", bs, amp)
+    if stress is not None:
+        preds[stress], _ = predict(model, data[stress], mode, bs, amp)
+        preds[f"{stress}_greedy"], _ = predict(model, data[stress], "greedy", bs, amp)
+    split_of = {k: data["val"] if k.startswith("val") else data["test"] for k in preds}
+    if stress is not None:
+        split_of[stress] = split_of[f"{stress}_greedy"] = data[stress]
+    metrics: dict = {k: report(split_of[k], p) for k, p in preds.items()}
+    greedy_text = DECODING_TEXT[f"greedy_{fam}"]
+    metrics["decoding"] = {
+        "primary": PRIMARY_DECODING[fam],
+        "mode": mode,
+        "width": width,
+        "candidate_widths": list(widths),
+        "val_by_width": val_by_width,
+        "width_selection": WIDTH_SELECTION if widths else None,
+        "description": DECODING_TEXT[PRIMARY_DECODING[fam]],
+        "keys": {
+            "val": f"primary ({mode})",
+            "test": f"primary ({mode})",
+            "val_greedy": greedy_text,
+            "test_greedy": greedy_text,
+        }
+        | ({"test_length_constrained": DECODING_TEXT["length"]} if fam == "gru" else {})
+        | (
+            {stress: f"primary ({mode}, val-selected width)", f"{stress}_greedy": greedy_text}
+            if stress is not None
+            else {}
+        ),
+        "stress": {"split": stress, "mode": mode, "width": width} if stress is not None else None,
+        "checkpoint_selection": TRAINING_SELECTION,
+        "seconds": time.time() - t0,
+    }
+    attention = None
+    if att is not None:
+        attention = {"attention": att, "mode": np.array(mode)}
+        if att_greedy is not None:
+            attention["attention_greedy"] = att_greedy
+    return metrics, (preds, split_of), attention
+
+
+def write_eval(run_dir: Path, metrics: dict, preds_split, attention: dict | None) -> None:
+    preds, split_of = preds_split
+    for key, p in preds.items():
+        rows = [
+            {"name": r["name"], "dir": r["dir"], "target": r["label"], "pred": x}
+            for r, x in zip(split_of[key].records, p, strict=True)
+        ]
+        (run_dir / f"pred_{key}.json").write_text(json.dumps(rows))
+    if attention is not None:
+        np.savez_compressed(run_dir / "attention_test.npz", **attention)
+    write_json(metrics, run_dir / "metrics.json")
+
+
+def decoding_spec(metrics: dict) -> dict:
+    """spec.json entries describing the evaluation decoding."""
+    dec = metrics["decoding"]
+    return {
+        "decoding_modes": dec["keys"],
+        "decoding": {k: v for k, v in dec.items() if k not in ("keys", "seconds")},
+        "selection": TRAINING_SELECTION,
+    }
+
+
+def load_data(
+    cfg: dict, cache: Path, device: str, smoke: bool, train: bool = True
+) -> dict[str, SvhnSplit]:
+    """train/val/test from the `cache_suffix` cache and the stress split (no suffix)."""
+    suffix = cfg.get("cache_suffix") or ""
+    stress = stress_split(cfg)
+    kw = {"crop": cfg["crop"], "jitter": cfg["color_jitter"]}
+    names = [s for s in ("train", "val", "test") if train or s != "train"]
+    data = {
+        s: SvhnSplit(
+            cache,
+            s,
+            cfg["max_len"],
+            device,
+            limit=SMOKE_SIZES[s] if smoke else None,
+            suffix=suffix,
+            **kw,
+        )
+        for s in names
+    }
+    if stress is not None:
+        lim = SMOKE_STRESS if smoke else None
+        data[stress] = SvhnSplit(cache, stress, cfg["max_len"], device, limit=lim, **kw)
+    logger.info(f"loaded {', '.join(f'{s} {len(d)}' for s, d in data.items())} on {device}")
+    return data
+
+
+def stress_split(cfg: dict) -> str | None:
+    return cfg.get("stress_split", "test_whole")
 
 
 @torch.no_grad()
@@ -178,116 +329,11 @@ def bench(model, a, cfg: dict, device: str, amp: bool) -> None:
     logger.info(f"bench {json.dumps(out)}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--seed", type=int, required=True)
-    ap.add_argument("--config", default="configs/phase1_task3.yaml")
-    ap.add_argument("--cache", default=None, help="override the SVHN cache directory")
-    ap.add_argument("--out", default=None, help="override results_root")
-    ap.add_argument("--smoke", action="store_true", help="2 epochs on 2,000/500/500 images")
-    ap.add_argument("--force", action="store_true")
-    bench_help = "time N training steps on random data and exit, no run directory (Phase 2)"
-    ap.add_argument("--bench", type=int, default=0, metavar="N", help=bench_help)
-    ap.add_argument("--bench-warmup", type=int, default=5)
-    ap.add_argument("--scan", choices=["parallel", "loop"], help="--bench only: Mamba scan")
-    ap.add_argument("--compile", action="store_true", help="--bench only: torch.compile mixer")
-    a = ap.parse_args()
-
-    cfg = yaml.safe_load(Path(a.config).read_text())
-    mcfg = cfg["models"][a.model]
-    kind = mcfg["kind"]
-    if a.bench:
-        if a.scan:
-            args = mcfg.setdefault("args", {})
-            args["mamba"] = dict(args.get("mamba") or {}) | {"scan": a.scan}
-        device = pick_device()
-        set_seed(a.seed)
-        extra = (
-            {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
-        )
-        model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
-        fcfg = FitConfig(**cfg["fit"])
-        bench(model, a, cfg, device, fcfg.amp == "bf16" and device == "cuda")
-        return
-    if a.scan or a.compile:
-        ap.error("--scan and --compile only apply to --bench (set mamba.scan in the config)")
+def build_spec(
+    a, cfg: dict, mcfg: dict, model, data, history, metrics, diag, fcfg, device, t0, run_dir, cache
+) -> dict:
+    kind, max_len, crop = mcfg["kind"], cfg["max_len"], cfg["crop"]
     phase = cfg.get("phase", "phase1")
-    root = Path(a.out or cfg["results_root"]) / ("smoke" if a.smoke else phase)
-    run_dir = root / "runs" / "task3" / a.model / f"seed{a.seed}"
-    if (run_dir / "metrics.json").exists() and not a.force:
-        logger.info(f"{run_dir} already done")
-        return
-    cache = Path(a.cache or cfg["svhn_dir"])
-    fingerprint = {
-        "model": mcfg,
-        "config": {k: v for k, v in cfg.items() if k not in ("models", "seeds")},
-        "seed": a.seed,
-        "smoke": a.smoke,
-        "data": file_identity(cache / "train_images.npy"),
-    }
-    prepare_run_dir(run_dir, fingerprint, a.force)
-    device = pick_device()
-    max_len, crop = cfg["max_len"], cfg["crop"]
-    data = {
-        s: SvhnSplit(
-            cache,
-            s,
-            max_len,
-            device,
-            crop=crop,
-            jitter=cfg["color_jitter"],
-            limit=SMOKE_SIZES[s] if a.smoke else None,
-        )
-        for s in ("train", "val", "test", "test_whole")
-    }
-    logger.info(f"loaded {', '.join(f'{s} {len(d)}' for s, d in data.items())} on {device}")
-
-    set_seed(a.seed)  # seeds the weight initialization too, not only training
-    extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
-    model = build(kind, mcfg.get("args"), max_len, **extra).to(device)
-    fcfg = FitConfig(**cfg["fit"])
-    amp = fcfg.amp == "bf16" and device == "cuda"
-    if not amp:
-        fcfg.amp = "none"
-    if a.smoke:
-        fcfg.epochs = 2
-    bs, ebs = cfg["batch_size"], cfg["eval_batch_size"]
-    modes = list(model.modes)  # type: ignore[arg-type]
-
-    def train_batches(epoch: int, g: torch.Generator):
-        return data["train"].iterate(bs, train=True, g=g)
-
-    def step_loss(m, b, epoch: int) -> torch.Tensor:
-        return m.loss(b)
-
-    def validate(m) -> float:
-        p, _ = predict(m, data["val"], "greedy", ebs, amp)
-        return 1.0 - float(np.mean([x == y for x, y in zip(p, data["val"].labels)]))
-
-    t0 = time.time()
-    groups = [{"params": list(model.parameters())}]
-    model, history = fit(run_dir, model, groups, train_batches, step_loss, validate, fcfg, a.seed)
-
-    metrics = {}
-    for key, (split, mode) in EVALS.items():
-        if mode not in modes:
-            continue
-        keep = key == "test" and kind in ATTENTION_KINDS
-        preds, attn = predict(model, data[split], mode, ebs, amp, keep_attention=keep)
-        metrics[key] = sequence_report(data[split].labels, preds)
-        rows = [
-            {"name": r["name"], "dir": r["dir"], "target": r["label"], "pred": p}
-            for r, p in zip(data[split].records, preds)
-        ]
-        (run_dir / f"pred_{key}.json").write_text(json.dumps(rows))
-        if attn is not None:
-            np.savez_compressed(run_dir / "attention_test.npz", attention=attn)
-
-    diag = mamba_diagnostics(model, data["test"], ebs, amp)
-    if diag is not None:
-        np.savez_compressed(run_dir / "mamba_dt_test.npz", **diag)
-
     best_epoch = int(np.argmin([h["val"] for h in history])) + 1
     audit_path = cache / "svhn_audit.json"
     audit = json.loads(audit_path.read_text()) if audit_path.exists() else {}
@@ -313,6 +359,19 @@ def main() -> None:
     )
     grid = [512, 7, 14] if kind == "ctc" else [512, 7, 7]
     d_tok = model.encoder.dim if isinstance(model, MixerAttentionGRURecognizer) else 512
+    suffix = cfg.get("cache_suffix") or ""
+    stress = stress_split(cfg)
+    size = cfg["size"]
+    if suffix:
+        cache_text = (
+            f"whole original image resized to {size}x{size} ignoring aspect, no ground-truth "
+            f"box anywhere (files {{split}}{suffix}_*)"
+        )
+    else:
+        cache_text = (
+            f"GT digit-box union squared, expanded 1.3x, clamped, resized to {size}x{size} "
+            "ignoring aspect (oracle localization at test)"
+        )
     spec = {
         "task": 3,
         "model": a.model,
@@ -330,15 +389,21 @@ def main() -> None:
         },
         "n_params": count_params(model),
         "input_shape": [3, crop, crop],
+        "setting": "whole_image" if suffix else "oracle_crop",
+        "cache_suffix": suffix,
         "crop_protocol": {
-            "cache": f"GT digit-box union squared, expanded 1.3x, clamped, resized to "
-            f"{cfg['size']}x{cfg['size']} ignoring aspect (oracle localization at test)",
+            "cache": cache_text,
             "train": f"random {crop}x{crop} crop, ColorJitter brightness/contrast/saturation "
             f"factors in [{1 - cfg['color_jitter']:.1f}, {1 + cfg['color_jitter']:.1f}]",
             "eval": f"center {crop}x{crop} crop",
-            "test_whole": f"whole image letterboxed to {cfg['size']}x{cfg['size']}, center crop",
+            "stress_split": stress,
             "normalization": "mean 0.5, std 0.5 per channel",
-        },
+        }
+        | (
+            {"test_whole": f"whole image letterboxed to {size}x{size}, center crop"}
+            if stress == "test_whole"
+            else {}
+        ),
         "output": f"digit string, 1 to {max_len} digits",
         "vocabulary": vocab,
         "length_head": {
@@ -361,18 +426,12 @@ def main() -> None:
             "ctc": "CTC (fp32)",
         }.get(kind, f"token CE (PAD ignored) + {cfg['length_loss_weight']} * length CE"),
         "teacher_forcing": "full" if kind in GRU_DECODER_KINDS else None,
-        "decoding_modes": {k: MODE_TEXT[m] for k, (_, m) in EVALS.items() if m in modes}
-        if kind in GRU_DECODER_KINDS
-        else {
-            "multihead": "argmax length, then the first L digit heads",
-            "ctc": "CTC best path",
-        }[kind],
+        **decoding_spec(metrics),
         "optimizer": "AdamW",
         "fit": vars(fcfg),
-        "batch_size": bs,
+        "batch_size": cfg["batch_size"],
         "epochs_run": len(history),
         "best_epoch": best_epoch,
-        "selection": "early stopping on validation exact-match (greedy)",
         "train_seconds": sum(h["seconds"] for h in history),
         "wall_seconds_this_session": time.time() - t0,
         "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
@@ -402,13 +461,209 @@ def main() -> None:
             if diag is not None
             else None
         )
+    return spec
+
+
+def log_result(run_dir: Path, metrics: dict, stress: str | None) -> None:
+    t, mode = metrics["test"], metrics["decoding"]["mode"]
+    msg = f"{run_dir} test ({mode}) exact {t['exact_match']:.4f} RMSE {t['RMSE']:.4f}"
+    msg += f", greedy exact {metrics['test_greedy']['exact_match']:.4f}"
+    if stress is not None:
+        msg += f", {stress} exact {metrics[stress]['exact_match']:.4f}"
+    logger.info(msg)
+
+
+# config keys that decide which images are evaluated and how (a missing key means the default)
+EVAL_DATA_KEYS = {"cache_suffix": "", "crop": None, "size": None, "max_len": None}
+
+
+def check_eval_fingerprint(fp: dict, a, cfg: dict, mcfg: dict, cache: Path, suffix: str) -> None:
+    """Refuse --eval-only when the model, seed or evaluation data differ from training."""
+    if fp.get("model") != mcfg or fp.get("seed") != a.seed:
+        raise SystemExit("the run was trained with another model config or seed")
+    old_cfg = fp.get("config", {})
+
+    def norm(c: dict, k: str):  # a null cache_suffix is the empty suffix
+        v = c.get(k, EVAL_DATA_KEYS[k])
+        return (v or "") if k == "cache_suffix" else v
+
+    data_diff = sorted(k for k in EVAL_DATA_KEYS if norm(old_cfg, k) != norm(cfg, k))
+    if data_diff:
+        raise SystemExit(f"--eval-only: data config keys differ from training: {data_diff}")
+    now = {k: v for k, v in cfg.items() if k not in ("models", "seeds")}
+    diff = sorted(k for k in set(now) | set(old_cfg) if old_cfg.get(k) != now.get(k))
+    if diff:
+        logger.warning(f"config keys differ from the training fingerprint: {diff}")
+    # the cache file the run was trained on (path follows svhn_dir or --cache)
+    path = cache / f"train{suffix}_images.npy"
+    if not path.exists():
+        raise SystemExit(f"--eval-only: {path} is missing (wrong --cache or cache_suffix?)")
+    trained, current = fp.get("data"), file_identity(path)
+    if trained is None:
+        logger.warning("the fingerprint has no data identity, the cache cannot be checked")
+    elif trained.get("size") != current["size"]:
+        raise SystemExit(
+            f"--eval-only: {current['path']} has {current['size']} bytes, training saw "
+            f"{trained.get('size')} (the cache was rebuilt or another cache is used)"
+        )
+    elif trained != current:
+        logger.warning(
+            f"cache identity differs from training (same size): trained {trained}, now "
+            f"{current}. The cache may have been rebuilt, check the records."
+        )
+
+
+def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
+    """Re-evaluate a finished run from ckpt.pt's best_state with the current decoding."""
+    for f in ("ckpt.pt", "metrics.json", "spec.json"):
+        if not (run_dir / f).exists():
+            raise SystemExit(f"--eval-only needs a finished run, {run_dir / f} is missing")
+    suffix = cfg.get("cache_suffix") or ""
+    fp_path = run_dir / "fingerprint.json"
+    if fp_path.exists():
+        check_eval_fingerprint(json.loads(fp_path.read_text()), a, cfg, mcfg, cache, suffix)
+    else:
+        logger.warning(f"{fp_path} is missing, the data identity cannot be checked")
+    ck = torch.load(run_dir / "ckpt.pt", map_location="cpu", weights_only=False)
+    if not ck.get("stopped", False):
+        raise SystemExit(f"{run_dir}/ckpt.pt is not a finished run")
+    device = pick_device()
+    kind = mcfg["kind"]
+    extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
+    model = build(kind, mcfg.get("args"), cfg["max_len"], **extra)
+    model.load_state_dict(ck["best_state"])
+    model = model.to(device).eval()
+    del ck
+    amp = FitConfig(**cfg["fit"]).amp == "bf16" and device == "cuda"
+    data = load_data(cfg, cache, device, a.smoke, train=False)
+    stress = stress_split(cfg)
+    old = json.loads((run_dir / "metrics.json").read_text())
+    backup = run_dir / "metrics_v1_greedy.json"
+    if "decoding" not in old and not backup.exists():
+        shutil.copy2(run_dir / "metrics.json", backup)
+        logger.info(f"backed up the greedy metrics to {backup}")
+    t0 = time.time()
+    metrics, preds, attention = evaluate(
+        model, data, stress, cfg["eval_batch_size"], amp, keep_attention=kind in ATTENTION_KINDS
+    )
+    write_eval(run_dir, metrics, preds, attention)
+    spec = json.loads((run_dir / "spec.json").read_text())
+    spec |= decoding_spec(metrics)
+    # runs trained before the two settings existed are the oracle crop setting (suffix "")
+    spec["setting"] = "whole_image" if suffix else "oracle_crop"
+    spec["cache_suffix"] = suffix
+    if isinstance(spec.get("crop_protocol"), dict):
+        spec["crop_protocol"]["stress_split"] = stress
+    spec["eval_only"] = {
+        "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
+        "seconds": time.time() - t0,
+        "previous_metrics": backup.name if backup.exists() else None,
+        "data": {s: file_identity(cache / f"{s}{suffix}_images.npy") for s in ("val", "test")},
+        "note": "re-evaluated from ckpt.pt best_state, no training",
+    }
+    write_json(spec, run_dir / "spec.json")
+    log_result(run_dir, metrics, stress)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--seed", type=int, required=True)
+    ap.add_argument("--config", default="configs/phase1_task3.yaml")
+    ap.add_argument("--cache", default=None, help="override the SVHN cache directory")
+    ap.add_argument("--out", default=None, help="override results_root")
+    ap.add_argument("--smoke", action="store_true", help="2 epochs on 2,000/500/500 images")
+    ap.add_argument("--force", action="store_true")
+    eval_help = "re-evaluate a finished run from ckpt.pt (no training) with the current decoding"
+    ap.add_argument("--eval-only", action="store_true", help=eval_help)
+    bench_help = "time N training steps on random data and exit, no run directory (Phase 2)"
+    ap.add_argument("--bench", type=int, default=0, metavar="N", help=bench_help)
+    ap.add_argument("--bench-warmup", type=int, default=5)
+    ap.add_argument("--scan", choices=["parallel", "loop"], help="--bench only: Mamba scan")
+    ap.add_argument("--compile", action="store_true", help="--bench only: torch.compile mixer")
+    a = ap.parse_args()
+
+    cfg = yaml.safe_load(Path(a.config).read_text())
+    mcfg = cfg["models"][a.model]
+    kind = mcfg["kind"]
+    if a.bench:
+        if a.scan:
+            args = mcfg.setdefault("args", {})
+            args["mamba"] = dict(args.get("mamba") or {}) | {"scan": a.scan}
+        device = pick_device()
+        set_seed(a.seed)
+        extra = (
+            {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
+        )
+        model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+        fcfg = FitConfig(**cfg["fit"])
+        bench(model, a, cfg, device, fcfg.amp == "bf16" and device == "cuda")
+        return
+    if a.scan or a.compile:
+        ap.error("--scan and --compile only apply to --bench (set mamba.scan in the config)")
+    if a.eval_only and a.force:
+        ap.error("--eval-only never retrains, do not combine it with --force")
+    phase = cfg.get("phase", "phase1")
+    root = Path(a.out or cfg["results_root"]) / ("smoke" if a.smoke else phase)
+    run_dir = root / "runs" / "task3" / a.model / f"seed{a.seed}"
+    cache = Path(a.cache or cfg["svhn_dir"])
+    if a.eval_only:
+        eval_only(a, cfg, mcfg, run_dir, cache)
+        return
+    if (run_dir / "metrics.json").exists() and not a.force:
+        logger.info(f"{run_dir} already done")
+        return
+    suffix = cfg.get("cache_suffix") or ""
+    fingerprint = {
+        "model": mcfg,
+        "config": {k: v for k, v in cfg.items() if k not in ("models", "seeds")},
+        "seed": a.seed,
+        "smoke": a.smoke,
+        "data": file_identity(cache / f"train{suffix}_images.npy"),
+    }
+    prepare_run_dir(run_dir, fingerprint, a.force)
+    device = pick_device()
+    data = load_data(cfg, cache, device, a.smoke)
+    stress = stress_split(cfg)
+
+    set_seed(a.seed)  # seeds the weight initialization too, not only training
+    extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
+    model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+    fcfg = FitConfig(**cfg["fit"])
+    amp = fcfg.amp == "bf16" and device == "cuda"
+    if not amp:
+        fcfg.amp = "none"
+    if a.smoke:
+        fcfg.epochs = 2
+    bs, ebs = cfg["batch_size"], cfg["eval_batch_size"]
+
+    def train_batches(epoch: int, g: torch.Generator):
+        return data["train"].iterate(bs, train=True, g=g)
+
+    def step_loss(m, b, epoch: int) -> torch.Tensor:
+        return m.loss(b)
+
+    def validate(m) -> float:  # training-time selection, greedy (see TRAINING_SELECTION)
+        p, _ = predict(m, data["val"], "greedy", ebs, amp)
+        return 1.0 - float(np.mean([x == y for x, y in zip(p, data["val"].labels)]))
+
+    t0 = time.time()
+    groups = [{"params": list(model.parameters())}]
+    model, history = fit(run_dir, model, groups, train_batches, step_loss, validate, fcfg, a.seed)
+
+    metrics, preds, attention = evaluate(
+        model, data, stress, ebs, amp, keep_attention=kind in ATTENTION_KINDS
+    )
+    diag = mamba_diagnostics(model, data["test"], ebs, amp)
+    if diag is not None:
+        np.savez_compressed(run_dir / "mamba_dt_test.npz", **diag)
+    spec = build_spec(
+        a, cfg, mcfg, model, data, history, metrics, diag, fcfg, device, t0, run_dir, cache
+    )
     write_json(history, run_dir / "history.json")
     write_json(spec, run_dir / "spec.json")
-    write_json(metrics, run_dir / "metrics.json")
-    logger.info(
-        f"{run_dir} test exact {metrics['test']['exact_match']:.4f} "
-        f"RMSE {metrics['test']['RMSE']:.4f}, whole exact {metrics['test_whole']['exact_match']:.4f}"
-    )
+    write_eval(run_dir, metrics, preds, attention)  # metrics.json last: it marks the run done
+    log_result(run_dir, metrics, stress)
 
 
 if __name__ == "__main__":

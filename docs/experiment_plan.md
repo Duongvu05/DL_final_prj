@@ -58,9 +58,10 @@ The coder's audit found that `MT_001` is exactly zero for all of 2011 and only b
 
 - Parse each MATLAB annotation, convert MATLAB label `10` to digit `0`, sort boxes by increasing `left` coordinate, and construct the target string. Retain original image-level identity; do not generate independent digit crops as samples.
 - The audit found 33,402 train images and 13,068 test images. Train lengths are 5,137/18,130/8,691/1,434/9/1 for lengths 1–6; test lengths are 2,483/8,356/2,081/146/2 for lengths 1–5. Public practice drops the single six-digit training example; do the same, set `MAX_LEN=5`, and report this exclusion explicitly. The resulting train+extra pool has 235,754 usable images before validation splitting.
-- Follow the de facto Goodfellow/GitHub/Kaggle protocol: compute the union of all digit boxes, square it with side `max(width,height)`, expand by 30% total (`0.15*side` on each side), clip to the original image, resize to `64x64` RGB without aspect preservation, then apply a random `54x54` crop during training and a center `54x54` crop during validation/test. Normalize RGB values with mean and standard deviation `(0.5, 0.5, 0.5)`, matching the closest public attention-GRU recipe; do not use ImageNet normalization in this non-pretrained CNN base.
-- Merge train and extra, assign a deterministic stratified 90/10 train/validation split by image hash, and keep the official 13,068-image test archive untouched. Test-time GT-box cropping is an **oracle localization protocol**: it is the main literature-comparable result, and the report must say that perfect digit localization is assumed. Also evaluate the same trained checkpoint on whole-image letterboxed inputs as a secondary harder stress test, not as the primary comparable score.
-- Use full teacher forcing for the first Phase 1 base, mild `ColorJitter`, and the random crop as the main augmentation. Do not flip horizontally or use transformations that alter digit order. The old whole-image 64x256 model remains a diagnostic only.
+- Follow the de facto Goodfellow/GitHub/Kaggle protocol for **Setting A (oracle crop)**: compute the union of all digit boxes, square it with side `max(width,height)`, expand by 30% total (`0.15*side` on each side), clip to the original image, resize to `64x64` RGB without aspect preservation, then apply a random `54x54` crop during training and a center `54x54` crop during validation/test. Normalize RGB values with mean and standard deviation `(0.5, 0.5, 0.5)`, matching the closest public attention-GRU recipe; do not use ImageNet normalization in this non-pretrained CNN base.
+- **Setting B (whole image, no boxes)** is a separate trained/evaluated experiment, not a stress evaluation of Setting A. Use the complete original image without digit boxes, resize it directly to `64x64` RGB, apply the same random `54x54` training crop and center `54x54` validation/test crop, and train a separate model from scratch. Neither the crop geometry nor any input feature may use test bounding boxes. This follows the whole-image comparison style of **“Deep Learning for Scene Text Recognition” (He et al., 2019)**.
+- Merge train and extra, assign a deterministic stratified 90/10 train/validation split by image hash, and keep the official 13,068-image test archive untouched. Setting A test crops are an **oracle localization protocol**: the report must say that perfect digit localization is assumed. Setting B must be reported as the no-localization result. The previously run crop-trained-checkpoint-on-whole-images score remains only a labelled cross-setting stress diagnostic and is not Setting B.
+- Use full teacher forcing for the first Phase 1 base, mild `ColorJitter`, and the random crop as the main augmentation in both settings. Do not flip horizontally or use transformations that alter digit order. Preserve separate cache manifests and checkpoints for Setting A and Setting B.
 
 **Two alternatives.**
 
@@ -90,7 +91,7 @@ The coder's audit found that `MT_001` is exactly zero for all of 2011 and only b
 
 The design is SOTA-informed but requirement-compliant. It uses the recurrent sequence encoder and attention pattern established for sequence-to-sequence learning, while the known calendar covariates and interpretable temporal weighting are informed by **“Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting” (Lim et al., 2021)**. Comparators include **“N-BEATS: Neural Basis Expansion Analysis for Interpretable Time Series Forecasting” (Oreshkin et al., 2020)**, **“Are Transformers Effective for Time Series Forecasting?” (Zeng et al., 2023)**, and **“A Time Series is Worth 64 Words: Long-term Forecasting with Transformers” (Nie et al., 2023)**. The novel project contribution is a controlled, matched comparison of recurrent attention and selective state-space memory at the exact short horizon required by the course, with repeated seeds and formal paired tests.
 
-**Phase 2 Mamba method: Seasonal-residual Mamba-2–GRU hybrid.** Replace only the BiGRU temporal encoder with two residual forward/reverse Mamba-2 blocks over the same target-only/lag/calendar input; retain the one-layer GRU readout, Bahdanau attention, `b24` seasonal skip, loss, and output head. Use `d_model=96`, `d_state=16`, `d_conv=4`, `expand=2`, RMSNorm, and dropout 0.20, with width tuned to stay within 5% of the Phase 1 GRU parameter count. The GRU readout preserves the course RNN requirement.
+**Phase 2 Mamba method: parameter-matched Seasonal-residual Mamba-2–GRU hybrid.** Replace only the BiGRU temporal encoder with two residual forward/reverse Mamba-2 blocks over the same target-only/lag/calendar input; retain the one-layer GRU readout, Bahdanau attention, `b24` seasonal skip, loss, and output head. Use `d_model=96`, `d_inner=64`, `d_state=16`, `d_conv=4`, `expand=2`, RMSNorm, and dropout 0.20; this gives approximately 175,181 parameters, within 5% of the 171,925-parameter Phase 1 attentive BiGRU. Match M1–M4 to M0 within 5% after the final parameter-count check. The GRU readout preserves the course RNN requirement.
 
 This choice is grounded in **“Mamba: Linear-Time Sequence Modeling with Selective State Spaces” (Gu and Dao, 2023)** and the more efficient **“Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality” (Dao and Gu, 2024)**. Its time-series adaptation is motivated by **“MambaTS: Improved Selective State Space Models for Long-term Time Series Forecasting” (Cai et al., 2024)** and **“TimeMachine: A Time Series is Worth 4 Mambas for Long-Term Forecasting” (Ahamed and Cheng, 2024)**. The project does not claim to reproduce MambaTS; it tests whether selective state updates help this shorter, multivariate electricity problem.
 
@@ -124,7 +125,7 @@ The primary Mamba comparison is the hybrid versus a parameter-matched Attentive 
 
 This model follows **“Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation” (Cho et al., 2014)** and **“Neural Machine Translation by Jointly Learning to Align and Translate” (Bahdanau et al., 2015)** for recurrent encoder–decoder and learned alignment, then adapts them to multi-horizon load forecasting. It is informed by **“Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting” (Lim et al., 2021)** because it conditions each future horizon on known covariates and analyzes temporal importance. The strongest modern comparators are N-BEATS (2020), DLinear (2023), and PatchTST (2023). Do not call the LSTM itself SOTA; call it an interpretable, requirement-compliant recurrent model tested against SOTA-informed and Mamba-based baselines.
 
-**Phase 2 Mamba method: Seasonal-residual Mamba-2 encoder plus attentive LSTM decoder.** Replace only the two-layer LSTM encoder with two residual causal Mamba-2 blocks (`d_model=96`, `d_state=16`, `d_conv=4`, `expand=2`); retain the one-layer LSTM residual decoder, teacher forcing ratio 1.0, future-calendar inputs, horizon embeddings, timestamp-aligned `b24` skip, Bahdanau attention, loss, and output head exactly as in Phase 1. Initialize the LSTM decoder state from a learned projection of the final Mamba state. This remains an encoder–decoder network with the required LSTM decoder; no future target values enter the Mamba encoder.
+**Phase 2 Mamba method: parameter-matched Seasonal-residual Mamba-2 encoder plus attentive LSTM decoder.** Replace only the two-layer LSTM encoder with two residual causal Mamba-2 blocks; retain the one-layer LSTM residual decoder, teacher forcing ratio 1.0, future-calendar inputs, horizon embeddings, timestamp-aligned `b24` skip, Bahdanau attention, loss, and output head exactly as in Phase 1. Use `d_model=112`, `d_inner=32`, `d_state=16`, `d_conv=4`, `expand=2`; this gives approximately 110,023 parameters, essentially equal to the 110,033-parameter Phase 1 attentive encoder–decoder. Match M1–M4 to M0 within 5% after the final parameter-count check. Initialize the LSTM decoder state from a learned projection of the final Mamba state. This remains an encoder–decoder network with the required LSTM decoder; no future target values enter the Mamba encoder.
 
 The rationale is the same selective-memory lineage: Mamba (2023), Mamba-2/SSD (2024), MambaTS (2024), and TimeMachine (2024). MambaTS is particularly relevant because it studies variable-aware scans and selective dropout for multivariate long-horizon forecasting. Here the horizon is only five, so the experiment is a targeted test of whether the selective state update is useful even when a Transformer is not computationally necessary.
 
@@ -141,32 +142,41 @@ Report both pooled metrics and metrics separately at horizons 1–5. The key fai
 
 ### 2.3 Task 3: CNN encoder plus recurrent attention decoder
 
-**Question:** Can a CNN encoder plus an attentive GRU decoder recover ordered variable-length house numbers from the standard cropped full-number SVHN protocol, and does attention improve over global pooling and CTC alternatives?
+**Question:** Can a CNN encoder plus an attentive GRU decoder recover ordered variable-length house numbers both with oracle localization and from complete images, and does attention improve over global pooling and CTC alternatives in each setting?
 
-**Phase 1 required model: Goodfellow/q19316-style cropped SVHN CNN + attentive GRU decoder.**
+**Phase 1 required model: Goodfellow/q19316-style SVHN CNN + attentive GRU decoder, trained separately in Settings A and B.**
 
 - Encoder: VGG-BN-style CNN with four convolutional stages, batch normalization, ReLU, pooling, and dropout, producing approximately `7x7` spatial tokens from the `54x54` crop. This is closer to the public SVHN attention-RNN practice than a ResNet-18 whose feature map becomes too small after aggressive downsampling.
 - Convert the feature map to visual tokens with learned 2-D position embeddings. Decoder: two-layer GRU, hidden size 256, additive visual attention over the tokens at every character step. Vocabulary is digits 0–9 plus `<SOS>`, `<EOS>`, and `<PAD>`.
-- Add a lightweight auxiliary length head with five classes (length 1–5), cross-entropy weight 0.2. At inference, constrain the decoder to the predicted length and use `<EOS>` as a safety stop; report both unconstrained and length-constrained decoding.
+- Add a lightweight auxiliary length head with five classes (length 1–5), cross-entropy weight 0.2. The official GRU result is beam-decoded; greedy and length-constrained greedy outputs are diagnostics only.
 - Training: full teacher forcing, cross-entropy without label smoothing, AdamW at `3e-4`, weight decay `1e-4`, batch size 64, maximum 16 epochs, learning rate multiplied by 0.1 at epoch 10, gradient clipping 5.0, and early stopping on validation exact-string accuracy.
-- Train on the 90% train+extra split using random `54x54` crops and moderate `ColorJitter`; evaluate the primary result with center `54x54` crops from GT union boxes. Greedy decoding is primary and beam size 3 is secondary. The crop at test is labeled oracle localization.
+- Train separate Setting A and Setting B models on the same 90% train+extra split using random `54x54` crops and moderate `ColorJitter`; evaluate each with center `54x54` crops. For each GRU decoder and setting, select beam width from `{3, 5, 10}` using validation exact-match accuracy after the checkpoint has been selected by validation greedy exact match; break validation ties in favor of the smaller beam. Freeze that width before test evaluation. Report beam decoding, never greedy, as the official GRU result. Setting A is labelled oracle localization, while Setting B uses no boxes at train or test time.
+- For CRNN-CTC, select CTC prefix-beam width from `{3, 5, 10}` on validation exact match and freeze it before test. For the multi-head CNN, use exact MAP decoding over length and digit-head probabilities, with no test-label length constraint. No decoding width, checkpoint, or post-processing rule may be selected from test results.
 
 This is SOTA-informed by **“Show, Attend and Tell: Neural Image Caption Generation with Visual Attention” (Xu et al., 2015)**, which established spatial attention for image-to-sequence generation; **“An End-to-End Trainable Neural Network for Image-based Sequence Recognition and Its Application to Scene Text Recognition” (Shi, Bai, and Yao, 2017)**, which established the CNN–recurrent sequence-recognition pattern; and **“ASTER: An Attentional Scene Text Recognizer with Flexible Rectification” (Shi et al., 2018)**, an attention-based scene-text sequence recognizer. A full ASTER or ABINet reimplementation is not required. The project contribution is a clean, auditable comparison between visual attention, CTC, and pooled recurrent decoding under the course’s four regression metrics, plus sequence accuracy/edit distance as necessary task metrics.
 
-**Phase 2 Mamba method: cropped CNN + bidirectional Vision-Mamba token mixer + attentive GRU decoder.** Keep the Phase 1 CNN, crop/augmentation, length head, and two-layer GRU attention decoder, but insert two residual bidirectional Mamba blocks between the CNN feature map and the decoder. Add 2-D position embeddings, scan visual tokens left-to-right and right-to-left, concatenate, and project back to 256 channels. Use `d_state=16`, `d_conv=4`, `expand=2`, and parameter-match the Phase 1 CNN+GRU model within 5%. The GRU decoder and visual attention remain mandatory, so this is still a CNN encoder plus RNN decoder rather than a pure Mamba recognizer.
+**Phase 2 Mamba method: parameter-matched CNN + bidirectional Vision-Mamba token mixer + attentive GRU decoder.** Run the same Mamba architecture separately in Setting A and Setting B, preserving each setting's input protocol, CNN, length head, decoder, beam-width selection, and validation checkpoint rule. Do not use the currently configured 7.95M-parameter Mamba model: it is 28% larger than the 6.20M Phase 1 CNN-attention-GRU. Reconfigure M0 to `d_model=128`, two bidirectional layers, `d_state=16`, `d_conv=4`, `expand=2`, and 2-D positions; this is approximately 6.20M parameters with the existing CNN/decoder. Match M1–M4 to M0 within 5% after the final parameter-count check. The GRU decoder and visual attention remain mandatory, so this is still a CNN encoder plus RNN decoder rather than a pure Mamba recognizer.
 
-This is an OCR-specific adaptation of **“Vision Mamba: Efficient Visual Representation Learning with Bidirectional State Space Model” (Zhu et al., 2024)** and **“VMamba: Visual State Space Model” (Liu et al., 2024)**, which address the position sensitivity of visual tokens and bidirectional/2-D selective scanning. The original **“Mamba: Linear-Time Sequence Modeling with Selective State Spaces” (Gu and Dao, 2023)** supplies the selective state-space mechanism. The project novelty is a controlled test on the same crop/extra protocol used by the Phase 1 public-practice base, while retaining the required recurrent decoder.
+This is an OCR-specific adaptation of **“Vision Mamba: Efficient Visual Representation Learning with Bidirectional State Space Model” (Zhu et al., 2024)** and **“VMamba: Visual State Space Model” (Liu et al., 2024)**, which address the position sensitivity of visual tokens and bidirectional/2-D selective scanning. The original **“Mamba: Linear-Time Sequence Modeling with Selective State Spaces” (Gu and Dao, 2023)** supplies the selective state-space mechanism. The project novelty is a controlled test on both the crop/extra protocol and the harder no-localization protocol, while retaining the required recurrent decoder.
 
 **Baselines and comparators.**
 
-1. Phase 1 CNN + attentive GRU with the auxiliary length head.
-2. Phase 1 same CNN + GRU decoder without visual attention.
-3. Phase 1 practice multi-head CNN length/position classifier as a non-recurrent baseline.
-4. Phase 1 CRNN-CTC diagnostic baseline; report its lower public-practice comparability honestly.
-5. Phase 2 CNN + bidirectional Vision-Mamba token mixer + attentive GRU decoder.
-6. The old whole-image 64x256 checkpoint evaluation is a secondary stress test, not a competing primary protocol. PARSeq remains literature context and is not a locked run.
+1. In each setting, Phase 1 CNN + attentive GRU with the auxiliary length head, reported with validation-selected beam search.
+2. In each setting, the same CNN + GRU decoder without visual attention, also reported with validation-selected beam search.
+3. In each setting, the public-practice multi-head CNN length/position classifier with exact MAP decoding.
+4. In each setting, the CRNN-CTC diagnostic baseline with validation-selected prefix beam search; report its protocol caveat honestly.
+5. In each setting, Phase 2 CNN + parameter-matched bidirectional Vision-Mamba token mixer + attentive GRU decoder.
+6. The old crop-trained-checkpoint-on-whole-image evaluation remains a labelled cross-setting stress diagnostic, not Setting B. PARSeq remains literature context and is not a locked run.
 
 Primary image metrics are computed on the decoded sequence, not on teacher-forced logits. Also report exact full-string accuracy, character accuracy, normalized Levenshtein distance, and length accuracy; these are necessary because four numeric regression metrics do not fully describe OCR quality.
+
+### 2.4 Phase 1 results and the Phase 1b linear-highway analysis
+
+The completed three-seed Phase 1 results establish the honest baseline before Mamba. Task 1 test RMSE is persistence `199.5` kW, daily seasonal `94.1`, weekly seasonal `105.9`, sparse ridge `79.1`, full-window ridge `68.78`, residual BiGRU `70.02±0.35`, and attentive residual BiGRU `70.68±0.76` (`R²≈0.909`). Task 2 pooled RMSE is daily seasonal `94.1`, sparse ridge `79.1`, full-window ridge `70.76`, residual LSTM encoder–decoder `73.45±1.38`, and attentive residual encoder–decoder `73.66±0.85`. Deep models beat full-window ridge on validation but not on the held-out test regime, so the report must not claim that attention or recurrence beats ridge. The Task 1 deep-versus-daily DM result is significant (`p=0.007`), while deep-versus-full-window-ridge and attention-versus-no-attention are not significant.
+
+The user-requested full-window linear highway is a documented **Phase 1b supplementary improvement**, not a replacement for the registered Phase 1 models and not a new Mamba claim. It is the LSTNet-style jointly trained linear skip over the standardized target window and target-hour features. The attentive highway model gives Task 1 `69.30±0.44` kW across seeds; averaging the three seed forecasts gives `68.49`, and validation-selected blending with full-window ridge (`0.9` highway ensemble + `0.1` ridge) gives `67.60`. For Task 2, the corresponding values are `72.37±1.12`, `70.60`, and `69.51` with validation-selected weights `0.8/0.2`. The Task 1 blend versus full-window ridge has bootstrap difference `-1.18` kW with 95% CI `[-6.02,+3.96]` and DM `p≈0.6`; therefore these are promising point estimates, not statistically established wins. Report them in a separate Phase 1b table and use the full-window ridge as the primary non-neural reference. Phase 2 Mamba is evaluated against both that ridge reference and the matched recurrent control; if it also fails the pre-registered paired test, report that result rather than tuning until it wins.
+
+The previously exported crop-setting Task 3 results (`95.76%±0.18` attention GRU, `95.59%` pooled GRU, `95.09%` multi-head CNN, `95.99%±0.14` CRNN-CTC) are **greedy-decoding provisional values**. They must be replaced in the report tables by validation-selected beam/MAP results under Setting A. The current `21.9%` whole-image result (roughly `19–24%` across models/seeds) is only the cross-setting stress diagnostic; it must not be labelled as the trained whole-image result. Setting B requires the new whole-image training runs specified in Section 4.4.
 
 ## 3. Ablation matrix
 
@@ -208,18 +218,18 @@ The decisive Task 2 Mamba evidence is T2-M0 versus T2-M1 and T2-M2, reported bot
 
 | ID | Variant | What it tests |
 |---|---|---|
-| T3-P0 | Cropped train+extra CNN + visual-attention GRU + length head | Required course model on the public-practice base |
-| T3-P1 | Same crop/extra model without visual attention | Required no-attention counterpart |
-| T3-P2 | Multi-head CNN length/position classifier | Common public-practice non-recurrent baseline |
-| T3-P3 | CRNN-CTC on the same crop/extra split | CTC diagnostic; report its public-practice caveat |
-| T3-P4 | Whole-image 64x256 stress evaluation of the cropped model | Localization/scale gap diagnostic, not a primary comparison |
-| T3-M0 | Cropped CNN + bidirectional Vision-Mamba token mixer + attentive GRU decoder | Proposed Mamba method |
-| T3-M1 | Cropped CNN + parameter-matched bidirectional GRU token mixer + identical attentive GRU decoder | Matched non-Mamba visual control |
-| T3-M2 | Vision-Mamba static-state control with input-independent selection parameters | Whether selective visual state updates matter |
-| T3-M3 | Forward-only visual Mamba scan | Whether bidirectional visual scanning matters |
-| T3-M4 | Remove learned 2-D position embeddings, keeping the same Mamba blocks | Whether positional marking is essential for ordered digits |
+| T3-P0 | Setting A or B CNN + visual-attention GRU + length head | Required course model in each input setting |
+| T3-P1 | Same setting-specific model without visual attention | Required no-attention counterpart |
+| T3-P2 | Setting-specific multi-head CNN length/position classifier | Common public-practice non-recurrent baseline |
+| T3-P3 | Setting-specific CRNN-CTC | CTC diagnostic with prefix-beam decoding |
+| T3-P4 | Crop-trained checkpoint evaluated on whole images | Cross-setting localization/scale diagnostic only |
+| T3-M0 | Setting A or B CNN + bidirectional Vision-Mamba token mixer + attentive GRU decoder | Proposed Mamba method in both settings |
+| T3-M1 | Setting-specific CNN + parameter-matched bidirectional GRU token mixer + identical attentive GRU decoder | Matched non-Mamba visual control |
+| T3-M2 | Setting-specific Vision-Mamba static-state control with input-independent selection parameters | Whether selective visual state updates matter |
+| T3-M3 | Setting-specific forward-only visual Mamba scan | Whether bidirectional visual scanning matters |
+| T3-M4 | Setting-specific Mamba without learned 2-D position embeddings | Whether positional marking is essential for ordered digits |
 
-The decisive Task 3 Mamba evidence is T3-M0 versus T3-M1 and T3-M2, using exact-string accuracy and the required numeric metrics. T3-M3/T3-M4 isolate the two visual adaptations motivated by Vision Mamba: bidirectional context and explicit position marking.
+The decisive Task 3 Mamba evidence is T3-M0 versus T3-M1 and T3-M2 separately in Setting A and Setting B, using validation-selected beam exact-string accuracy and the required numeric metrics. T3-M3/T3-M4 isolate the two visual adaptations motivated by Vision Mamba: bidirectional context and explicit position marking. A Mamba gain in only the oracle setting must not be generalized to end-to-end whole-image recognition.
 
 ### 3.1 What counts as evidence that Mamba works
 
@@ -233,7 +243,7 @@ The bootstrap resamples test origins in blocks for Tasks 1–2 and test images f
 
 **Time series:** chronological 70% train, 15% validation, 15% test by hourly timestamp. Construct a window only when the forecast target lies wholly in its split. It is acceptable for a validation/test input window to use historical context immediately before the split boundary, because that is available at prediction time; it is not acceptable to use any future value. Fit scalers, feature selection, missing-value rules, and all hyperparameters using train/validation only. Test is run once after model selection.
 
-**SVHN:** remove the single six-digit train example, merge the remaining official train and extra images, and split the resulting 235,754-image pool 90/10 into train/validation with a fixed hash manifest stratified by sequence length. Keep the official 13,068-image test archive untouched. The primary test protocol crops every image with its own GT union box expanded 1.3x; label this oracle localization. Also export a whole-image stress evaluation using the same trained checkpoint. Any duplicate-image audit must happen before splitting; duplicates or near-duplicates crossing train/validation/test are removed from training and reported.
+**SVHN:** remove the single six-digit train example, merge the remaining official train and extra images, and split the resulting 235,754-image pool 90/10 into train/validation with a fixed hash manifest stratified by sequence length. Keep the official 13,068-image test archive untouched. Train and evaluate two separate settings: Setting A crops every image with its own GT union box expanded 1.3x and is labelled oracle localization; Setting B uses the complete image resized to `64x64` with no boxes at train or test time. The old crop-checkpoint-on-whole-image result is only a stress diagnostic. Any duplicate-image audit must happen before splitting; the completed audit found no exact SHA-1 duplicates, but found near-duplicate groups requiring manual review, including one train/test group. Resolve or explicitly report any confirmed cross-split near-duplicate before final metrics.
 
 ### 4.2 Reproducibility and preemption
 
@@ -252,9 +262,9 @@ For time series, test each Mamba method against its parameter-matched recurrent 
 - Use a paired moving-block bootstrap with 10,000 replicates over chronological test origins, block length 168 hours. Report the 95% confidence interval for the difference in RMSE, MAE, and pooled NSE. Do not resample individual overlapping rows independently.
 - For a main Mamba contrast, average the same-seed loss difference at each test origin across seeds `0, 1, 2`, then run DM and the block bootstrap on that paired series. Also report each seed's result. For mechanism ablations, use the same procedure over the three paired predictions. Apply Holm correction within each task to the two primary Mamba hypotheses (`M0-M1`, `M0-M2`); label `M3/M4` as secondary mechanism tests.
 
-For SVHN, use a paired bootstrap over test images with 10,000 replicates for the difference in exact-string accuracy, character accuracy, MAE, and RMSE. Average the same-seed per-image loss differences before the bootstrap for M0-M1 and M0-M2. For exact-string correctness, add McNemar's test between the Mamba method and matched control and between the course main and strongest baseline. Apply Holm correction to the two primary Mamba hypotheses. Use two-sided tests and state that statistical significance is secondary to effect size and confidence intervals.
+For SVHN, use a paired bootstrap over test images with 10,000 replicates for the difference in exact-string accuracy, character accuracy, MAE, and RMSE, separately for Setting A and Setting B. Average the same-seed per-image loss differences before the bootstrap for M0-M1 and M0-M2. For exact-string correctness, add McNemar's test between the Mamba method and matched control and between the course main and strongest baseline. Apply Holm correction within each setting to the two primary Mamba hypotheses. Use two-sided tests and state that statistical significance is secondary to effect size and confidence intervals.
 
-With exactly three seeds, the primary image test is the paired bootstrap over per-image differences after averaging the three same-seed correctness/loss values. Do not pretend that the 3 x 13,068 seed-image pairs are independent. McNemar's test may be reported separately for each seed as a descriptive secondary check, but the claim-supporting interval is the clustered per-image bootstrap; no seed-level t-test is allowed.
+With exactly three seeds, the primary image test is the paired bootstrap over per-image differences after averaging the three same-seed correctness/loss values. Do not pretend that the 3 x 13,068 seed-image pairs are independent. Decode-width selection is performed only on validation: GRU and CTC prefix beams test widths `{3,5,10}`, ties choose the smaller width, and the chosen width is frozen before test. Multi-head MAP decoding has no tunable width. McNemar's test may be reported separately for each seed as a descriptive secondary check, but the claim-supporting interval is the clustered per-image bootstrap; no seed-level t-test is allowed.
 
 Do not claim that a p-value proves one deep architecture is universally superior. The valid claim is conditional on this dataset, horizon, preprocessing, and model budget.
 
@@ -262,25 +272,27 @@ Do not claim that a p-value proves one deep architecture is universally superior
 
 This is the final matrix, not a menu. A short smoke/checkpoint run is allowed before it, but it must also use exactly seeds `0, 1, 2` and cannot replace the listed runs. Every listed model/baseline evaluation uses exactly seeds `0, 1, 2`. Phase 1 must finish and export its tables before any Phase 2 run starts. The modern N-BEATS/DLinear/PatchTST papers remain literature context, but those extra models are not in this locked execution matrix because the user explicitly ordered Phase 1 to contain only report-required baselines/course models and Phase 2 to contain only Mamba proposals/ablations.
 
-| Phase | Task | Model family | Seeds | Runs | Estimated active A100 hours |
+| Phase | Task/setting | Model family | Seeds | Runs | Estimated active A100 hours |
 |---|---:|---|---:|---:|---:|
 | 1 | 1 | Persistence, daily/weekly timestamp-aligned seasonal naive, sparse ridge, full-window target-only ridge | 0,1,2 | 12 model/seed evaluations | 0.0 |
 | 1 | 1 | Seasonal-residual Attentive BiGRU-2 and same residual GRU without attention | 3 each | 6 | 0.8 |
 | 1 | 2 | Persistence, daily/weekly timestamp-aligned seasonal naive, sparse ridge, full-window target-only ridge | 0,1,2 | 12 model/seed evaluations | 0.0 |
 | 1 | 2 | Seasonal-residual attentive LSTM encoder–decoder and same residual decoder without attention | 3 each | 6 | 0.9 |
-| 1 | 3 | Cropped train+extra CNN-attention GRU, no-attention GRU, multi-head CNN, and CRNN-CTC | 3 each | 12 | 15.6 |
-| 1 | 3 | Whole-image 64x256 stress evaluation of the cropped model | 3 | 3 evaluations | 0.3 |
+| 1 | 3A oracle crop | Original train+extra CNN-attention GRU, no-attention GRU, multi-head CNN, and CRNN-CTC training | 3 each | 12 model/seed evaluations, completed Phase 1 run | 15.6 already spent |
+| 1 | 3A oracle crop | Existing cropped train+extra CNN-attention GRU, no-attention GRU, multi-head CNN, and CRNN-CTC checkpoints; re-evaluate with validation-selected beam/MAP decoding | 3 each | 12 decoding evaluations, no retraining | 0.5 |
+| 1 | 3B whole image | Separately trained whole-image train+extra CNN-attention GRU, no-attention GRU, multi-head CNN, and CRNN-CTC | 3 each | 12 model/seed evaluations | 15.6 |
+| 1 | 3 diagnostic | Crop-trained checkpoint evaluated on whole-image inputs | 3 | 3 cross-setting evaluations | 0.3 |
 | 1 | all | Three-seed smoke runs, extra-cache/checkpoint validation, and Phase 1 export verification | 0,1,2 | operational checks, not model/seed totals | 1.5 |
 | 2 | 1 | Seasonal-residual Mamba-2–GRU T1-M0 and matched residual BiGRU T1-M1 | 3 each | 6 | 2.4 |
 | 2 | 1 | Static-state, no-local-conv, forward-only T1-M2–M4 | 3 each | 9 | 2.7 |
 | 2 | 2 | Seasonal-residual Mamba-2 encoder + attentive LSTM decoder T2-M0 and matched residual LSTM T2-M1 | 3 each | 6 | 3.0 |
 | 2 | 2 | Static-state, no-local-conv, no-decoder-attention T2-M2–M4 | 3 each | 9 | 3.6 |
-| 2 | 3 | Cropped CNN + Vision-Mamba token mixer T3-M0 and matched visual-GRU mixer T3-M1 | 3 each | 6 | 8.4 |
-| 2 | 3 | Static-state, forward-only, no-position T3-M2–M4 | 3 each | 9 | 9.9 |
+| 2 | 3A oracle crop | Parameter-matched CNN + Vision-Mamba token mixer T3-M0, matched visual-GRU T3-M1, and T3-M2–M4 ablations | 3 each | 15 model/seed evaluations | 18.3 |
+| 2 | 3B whole image | The same parameter-matched Mamba/control/ablation matrix trained and evaluated without boxes | 3 each | 15 model/seed evaluations | 18.3 |
 | 2 | all | Three-seed smoke runs, checkpoint validation, and Phase 2 export verification | 0,1,2 | operational checks, not model/seed totals | 1.5 |
-| **Total** |  |  |  | **96 model/seed evaluations** | **50.6 active hours** |
+| **Total** |  |  |  | **123 trained model/seed evaluations + 12 decoding-only re-evaluations** | **85.0 active hours** |
 
-CPU-only seasonal/ridge metrics, statistical tests, and report exports do not consume meaningful A100 time. Reserve **65 A100 wall-clock hours**: approximately 51 active training/evaluation hours plus 14 hours for extra-data caching, preemption, resume, compilation, and queue delay. Do not add PARSeq, N-BEATS, DLinear, PatchTST, extra hyperparameter searches, or non-Mamba ablations before the report is complete. The must-have scientific result is the Phase 1 public-practice table followed by the Phase 2 matched Mamba/control/static-state matrix with seeds `0, 1, 2`.
+CPU-only seasonal/ridge metrics, Phase 1b blending, statistical tests, and report exports do not consume meaningful A100 time. Reserve **105 A100 wall-clock hours**: approximately 85 active training/evaluation hours plus 20 hours for preemption, resume, compilation, validation-width selection, and queue delay. Do not add PARSeq, N-BEATS, DLinear, PatchTST, extra hyperparameter searches, or non-Mamba ablations before the report is complete. The must-have scientific result is the two-setting Phase 1 table followed by the two-setting, parameter-matched Phase 2 Mamba/control/static-state matrix with seeds `0, 1, 2`.
 
 ## 5. Exact metrics
 
@@ -318,33 +330,28 @@ Two defensible secondary conventions should be mentioned in the report: (1) macr
 
 ### 5.3 Image-to-sequence Task 3
 
-For image `i`, let the ground-truth digit sequence be `y_i = (y_{i,1},...,y_{i,L_i})`, with `y_{i,j} in {0,...,9}`. Decode the model autoregressively, remove `<SOS>`, stop at `<EOS>`, and let `hat{y}_{i,j}` be the decoded digit at position `j`.
+For image `i`, let the ground-truth digit sequence be `y_i = (y_{i,1},...,y_{i,L_i})`, with `y_{i,j} in {0,...,9}`. Decode with the frozen validation-selected beam/MAP rule, remove `<SOS>`, stop at `<EOS>`, and let `hat{y}_{i,j}` be the decoded digit at position `j`.
 
-The primary numeric convention is a **fixed-position, length-aware padded representation**:
+To prevent extra digits from being invisible to the required numeric metrics, the **primary numeric convention is a penalty-aware variable-width representation**. Reserve numeric sentinel `10` for a missing or extra sequence position. For each image set `q_i=max(L_i,hat{L}_i)`, `u_{i,j}=y_{i,j}` when `j<=L_i` and `10` otherwise, and `v_{i,j}=hat{y}_{i,j}` when `j<=hat{L}_i` and `10` otherwise, for `j=1..q_i`. Thus an early EOS creates a prediction of 10 against a true digit, and an extra digit creates a prediction of 0–9 against a true sentinel 10. Do not include positions after `q_i` where both sides are absent.
 
-- Evaluate positions `j = 1..MAX_LEN`.
-- For true positions `j <= L_i`, use the decoded digit if present; if the decoder emits `<EOS>` too early, assign a missing-digit prediction of `0` for that position so early stopping is penalized.
-- For `j > L_i`, do not include the position in R2/NSE/MAE/RMSE; PAD is not a numeric digit and must never enter these metrics.
-- If the decoder emits extra digits after the true end, count them in the separate length/edit metrics, not as numeric target digits.
-
-Let `M = sum_i L_i` be the number of valid target digit positions and let `z_{i,j}` be the padded/aligned prediction for those positions:
+Let `M = sum_i q_i` and let `v_{i,j}` and `u_{i,j}` be the aligned values above:
 
 ```text
-MAE  = (1/M) * sum_i sum_{j=1..L_i} |z_{i,j} - y_{i,j}|
-RMSE = sqrt((1/M) * sum_i sum_{j=1..L_i} (z_{i,j} - y_{i,j})^2)
-R2   = 1 - sum_i sum_{j=1..L_i} (z_{i,j} - y_{i,j})^2
-           / sum_i sum_{j=1..L_i} (y_{i,j} - mean_valid(y))^2
-NSE  = 1 - sum_i sum_{j=1..L_i} (z_{i,j} - y_{i,j})^2
-           / sum_i sum_{j=1..L_i} (y_{i,j} - mean_valid(y))^2
+MAE  = (1/M) * sum_i sum_{j=1..q_i} |v_{i,j} - u_{i,j}|
+RMSE = sqrt((1/M) * sum_i sum_{j=1..q_i} (v_{i,j} - u_{i,j})^2)
+R2   = 1 - sum_i sum_{j=1..q_i} (v_{i,j} - u_{i,j})^2
+           / sum_i sum_{j=1..q_i} (u_{i,j} - mean(u))^2
+NSE  = 1 - sum_i sum_{j=1..q_i} (v_{i,j} - u_{i,j})^2
+           / sum_i sum_{j=1..q_i} (u_{i,j} - mean(u))^2
 ```
 
-This is the primary convention because it is explicit about variable length, penalizes early termination, and does not assign an artificial numeric value to PAD. Again, R2 and NSE are identical under the shared denominator. Also report these secondary sequence conventions:
+This is the primary convention because it penalizes both early termination and extra digits rather than silently dropping them. The sentinel is a pre-registered evaluation value, not a model input or training label. R2 and NSE are identical under the shared denominator. Also report these secondary sequence conventions:
 
 1. **Position macro-average:** calculate metrics for each position over images that have a true digit at that position, then average positions. This prevents the common first digit from dominating, but has higher variance for rare positions.
 2. **Sample macro-average:** calculate metrics per image over its valid digits, then average images. This gives every number equal weight.
-3. **Fixed-width padded:** encode EOS/PAD as categorical states and report classification accuracy, not R2/NSE/MAE/RMSE. This is useful for diagnosing length errors but is not the primary required metric.
+3. **True-position conditional:** calculate the old valid-target-position metrics without the sentinel, explicitly labelled as a diagnostic. This is useful for comparison with earlier greedy tables but is not the primary required metric because it ignores extra digits.
 
-The report must not present R2/NSE as sufficient OCR metrics. Add exact full-sequence accuracy, exact length accuracy, per-character accuracy over aligned valid positions, and normalized Levenshtein distance. These identify cases where numeric digit error is small but the whole number is still wrong.
+The report must not present R2/NSE as sufficient OCR metrics. Add exact full-sequence accuracy, exact length accuracy, per-character accuracy over aligned valid positions, and normalized Levenshtein distance. These identify cases where numeric digit error is small but the whole number is still wrong. Use the same sentinel-aware per-image losses for the paired bootstrap.
 
 ## 6. Analysis experiments and report figures
 
@@ -357,8 +364,8 @@ The following figures are enough for a strong report; avoid producing decorative
 5. **Task 1 attention/state heatmaps:** temporal attention weights and Mamba selection/state diagnostics over the 168-hour input for several test cases, with markers at 24-hour and 168-hour lags. Include a failure case, not only a success case.
 6. **Task 2 horizon plot:** MAE and RMSE at horizons 1–5 for all key models, including Mamba encoder–decoder and matched LSTM. This is the main evidence for error accumulation and whether selective memory helps at later steps.
 7. **Task 2 attention/state examples:** encoder-time versus decoder-horizon attention heatmaps, plus Mamba-vs-static-state diagnostics; discuss whether different horizons use different historical positions.
-8. **Task 3 qualitative grid:** correct and incorrect SVHN predictions from course-main, Mamba, and matched visual-GRU models, showing input image, ground-truth string, prediction, and attention overlay for each decoded character.
-9. **Task 3 Mamba ablation/error breakdown:** exact-sequence accuracy by number length, character accuracy by position, M0/M1/M2 confidence intervals, and separate early-EOS, wrong-digit, extra-digit, and position-embedding failures.
+8. **Task 3 qualitative grid:** separate Setting A and Setting B correct/incorrect SVHN predictions from course-main, Mamba, and matched visual-GRU models, showing input image, ground-truth string, prediction, decoder type/beam width, and attention overlay for each decoded character.
+9. **Task 3 setting and Mamba breakdown:** exact-sequence accuracy by number length for both settings, character accuracy by position, sentinel-aware numeric metrics, M0/M1/M2 confidence intervals, and separate early-EOS, wrong-digit, extra-digit, localization, and position-embedding failures.
 10. **Compute/accuracy trade-off:** parameter count, training time, and test RMSE/sequence accuracy for the main models and comparators. This prevents a small improvement from being presented without cost.
 
 Required tables: dataset audit statistics and splits; complete model hyperparameters and parameter counts; primary metrics with mean ± standard deviation over seeds; per-horizon Task 2 metrics; Task 3 numeric and OCR metrics; Mamba ablations with adjusted p-values and confidence intervals; and the final run/checkpoint manifest.
@@ -370,11 +377,11 @@ The coder must not start Phase 2 until every Phase 1 run has finished, its check
 ### Phase 0: locked data and export setup
 
 1. Download the UCI and SVHN files, record checksums, parse the audited decimal-comma UCI file, and verify the exact row/image counts.
-2. Freeze `MT_235`, the target-only/seasonal-residual feature definitions, the chronological time-series splits, the SVHN train+extra validation hash split, and `MAX_LEN=5` after dropping the one six-digit training image.
-3. Implement leakage-safe windowing, train-only scaling, inverse transforms, the four required metric functions, masked sequence metrics, and hand-worked unit tests.
+2. Freeze `MT_235`, the target-only/seasonal-residual feature definitions, the chronological time-series splits, the SVHN train+extra validation hash split, both SVHN input caches/settings, and `MAX_LEN=5` after dropping the one six-digit training image.
+3. Implement leakage-safe windowing, train-only scaling, inverse transforms, the four required metric functions, sentinel-aware sequence metrics, validation-only decoding-width selection, and hand-worked unit tests.
 4. Implement checkpoint/resume with model, optimizer, scheduler, scaler, RNG, epoch, and data-order state. Validate resumption on the shared A100 before any final run.
 
-Phase 0 is CPU/I/O work plus the three-seed extra-data caching/resume smoke test already budgeted in the Phase 1 “all” row of Section 4.4. It exports `manifests/dataset_manifest.json`, `manifests/split_manifest.json`, `manifests/environment.json`, and `manifests/checksums.txt`.
+Phase 0 is CPU/I/O work plus the three-seed extra-data caching/resume smoke test already budgeted in the Phase 1 “all” row of Section 4.4. It builds separate oracle-crop and whole-image caches, records the completed exact/near-duplicate audit and its manual-review decision, and exports `manifests/dataset_manifest.json`, `manifests/split_manifest.json`, `manifests/environment.json`, and `manifests/checksums.txt`.
 
 ### Phase 1: report-required baselines and course models only
 
@@ -382,29 +389,32 @@ Phase 1 is intentionally limited to the models needed for the template's experim
 
 - **Task 1:** target-only `MT_235` history, per-target scaling, timestamp-aligned daily/weekly bases, corrected sparse/full-window ridge, required seasonal-residual Attentive BiGRU-2, and the same residual GRU without attention.
 - **Task 2:** the same target-only/residual preprocessing, corrected direct ridge, required seasonal-residual attentive LSTM encoder–decoder, and the same residual encoder–decoder without attention.
-- **Task 3:** GT union-box crop expanded 1.3x, square 64x64 resize, random train 54x54 crop, center eval crop, train+extra with deterministic 90/10 validation, required CNN+attentive GRU with length head, no-attention GRU, public-practice multi-head CNN, CRNN-CTC diagnostic, and a whole-image stress evaluation.
+- **Task 3 Setting A:** GT union-box crop expanded 1.3x, square 64x64 resize, random train 54x54 crop, center eval crop, train+extra with deterministic 90/10 validation, required CNN+attentive GRU with length head, no-attention GRU, public-practice multi-head CNN, and CRNN-CTC diagnostic. Existing checkpoints are re-evaluated with validation-selected beam/MAP decoding; no retraining is needed for this setting.
+- **Task 3 Setting B:** complete whole images resized directly to 64x64 with no boxes, the same random/center 54x54 crop protocol, a separate deterministic 90/10 train+extra split, and separately trained versions of the same four models. The old crop-trained-checkpoint whole-image number is retained only as a cross-setting diagnostic.
 
-Run every Phase 1 model or baseline under exactly seeds `0, 1, 2`, export all Phase 1 tables, and stop. For deterministic CPU baselines, execute the same three-seed evaluation jobs and write one row per seed even when predictions are identical. Do not run Mamba, Mamba ablations, N-BEATS, DLinear, PatchTST, PARSeq, random-CNN controls, or exploratory non-Mamba ablations in Phase 1. The expected Phase 1 A100 allowance is approximately 19 active hours, including extra-cache and resume validation; CPU baselines and statistics are outside that estimate.
+Run every Phase 1 model or baseline under exactly seeds `0, 1, 2`, export all Phase 1 tables, and stop. For deterministic CPU baselines, execute the same three-seed evaluation jobs and write one row per seed even when predictions are identical. Do not run Mamba, Mamba ablations, N-BEATS, DLinear, PatchTST, PARSeq, random-CNN controls, or exploratory non-Mamba ablations in Phase 1. Phase 1b is analysis of the already completed linear-highway/ensemble runs and does not replace the locked Phase 1 models. The expected Phase 1 A100 allowance is approximately 35.2 active hours, including whole-image retraining, oracle-crop decoding re-evaluation, extra-cache, and resume validation; CPU baselines, Phase 1b statistics, and blending are outside that estimate.
 
 Required Phase 1 deliverables:
 
 - `results/phase1/task1_metrics_by_seed.csv` and `results/phase1/task1_metrics_summary.csv` with R2, NSE, MAE, RMSE for every baseline/model and seed.
 - `results/phase1/task2_metrics_by_seed.csv`, `task2_metrics_summary.csv`, and `task2_metrics_by_horizon.csv` with pooled and horizon-wise metrics.
-- `results/phase1/task3_metrics_by_seed.csv` and `task3_metrics_summary.csv` with R2, NSE, MAE, RMSE, exact-string accuracy, character accuracy, length accuracy, and normalized edit distance for both the primary oracle-crop protocol and the whole-image stress protocol.
+- `results/phase1/task3_metrics_by_seed.csv` and `task3_metrics_summary.csv` with R2, NSE, MAE, RMSE, exact-string accuracy, character accuracy, length accuracy, and normalized edit distance separately for Setting A, Setting B, and the labelled cross-setting stress diagnostic. The official GRU/CTC rows must use validation-selected beams; the multi-head rows must use exact MAP decoding.
+- `results/phase1/task1_phase1b.csv` and `task2_phase1b.csv` with per-seed highway metrics, three-seed ensemble metrics, validation-selected ridge blending weights, confidence intervals, and the explicit conclusion that the observed point improvements over full-window ridge are not statistically significant.
 - `results/phase1/predictions/` containing one machine-readable prediction file per model/seed and the per-origin/per-sample error files required for paired comparisons.
-- `figures/phase1/` containing the dataset overview, residual-baseline forecast panels, Task 2 horizon plot, cropped SVHN qualitative/error plots, and the crop-vs-whole-image diagnostic.
+- `figures/phase1/` containing the dataset overview, residual-baseline forecast panels, Task 2 horizon plot, separate Setting A/Setting B SVHN qualitative/error plots, the two-setting comparison, and the crop-trained-checkpoint stress diagnostic.
 
 ### Phase 2: Mamba proposals and Mamba ablations only
 
-Start Phase 2 only after the Phase 1 export checklist passes. Run exactly the M0/M1/M2/M3/M4 models in Section 4.4 with seeds `0, 1, 2`, reusing the Phase 1 data protocol and matched parameter budgets:
+Start Phase 2 only after the Phase 1 export checklist passes. Run exactly the M0/M1/M2/M3/M4 models in Section 4.4 with seeds `0, 1, 2`, reusing the Phase 1 data protocol and matched parameter budgets. Phase 2 Task 3 is run in both image settings so a Mamba result cannot be attributed only to oracle localization:
 
 - Task 1: seasonal-residual Mamba-2–GRU hybrid, matched Phase 1 residual BiGRU, static-state Mamba, no-local-convolution Mamba, and forward-only Mamba.
 - Task 2: seasonal-residual Mamba-2 encoder plus attentive LSTM decoder, matched Phase 1 residual LSTM encoder, static-state Mamba, no-local-convolution Mamba, and no-decoder-attention Mamba.
-- Task 3: cropped train+extra CNN plus Vision-Mamba token mixer plus attentive GRU decoder, matched visual-GRU mixer, static-state visual Mamba, forward-only visual Mamba, and no-position visual Mamba.
+- Task 3 Setting A: oracle-crop train+extra CNN plus parameter-matched Vision-Mamba token mixer and attentive GRU decoder, matched visual-GRU mixer, static-state visual Mamba, forward-only visual Mamba, and no-position visual Mamba.
+- Task 3 Setting B: the identical parameter-matched matrix trained and evaluated on whole images without boxes.
 
-Export the same Phase 1 metrics plus `results/phase2/mamba_ablation_metrics_by_seed.csv`, `mamba_ablation_summary.csv`, `paired_error_differences.csv`, `dm_tests.csv`, `bootstrap_confidence_intervals.csv`, and `holm_adjusted_tests.csv`. Export Mamba selection/state diagnostics and attention maps for the figures in `figures/phase2/`.
+Export the same Phase 1 metrics plus `results/phase2/mamba_ablation_metrics_by_seed.csv`, `mamba_ablation_summary.csv`, `paired_error_differences.csv`, `dm_tests.csv`, `bootstrap_confidence_intervals.csv`, and `holm_adjusted_tests.csv`, with a `setting` column for Task 3. Export Mamba selection/state diagnostics and attention maps for both Task 3 settings in `figures/phase2/`. Record the pure-PyTorch backend and ONNX export status; do not treat ONNX export as a model comparison.
 
-The locked Phase 2 allowance is approximately 32 active A100 hours. The total locked experiment budget is therefore approximately 51 active A100 hours. Reserve 65 A100 wall-clock hours for extra-data caching, preemption, resume, compilation, and queue delay. Use `mamba-ssm` with the existing PyTorch 2.8/CUDA 12.9 environment; use `mambapy` only as a recorded fallback if compilation fails. Use the project virtual environment/`uv`, persistent storage, plain `nohup` for background jobs, and the pod keepalive procedure. Do not use `pm2`.
+The locked Phase 2 allowance is approximately 49.8 active A100 hours. The total locked experiment budget is therefore approximately 85 active A100 hours. Reserve 105 A100 wall-clock hours as specified in Section 4.4. Use the verified pure-PyTorch implementation for the final runs; no CUDA `mamba-ssm` kernel is required for this matrix. Use the project virtual environment/`uv`, persistent storage, plain `nohup` for background jobs, and the pod keepalive procedure. Do not use `pm2`.
 
 ### Phase 3: report construction and required export contract
 
@@ -421,14 +431,14 @@ The coder must export the following exact facts so every template field can be f
 
 | Export | Required contents |
 |---|---|
-| `dataset_manifest.json` | Dataset name, authoritative download URL, raw filename, checksum, raw observations, hourly observations, all 370 original attributes, train-only stable-client audit count (expected 155), frequency, time period, `pred_column=MT_235`, target mean/std/min/max/zero count, UCI decimal-comma/DST convention, SVHN train/extra/test counts, excluded six-digit count, GT-crop geometry, whole-image geometry, resized canvas, sequence vocabulary, `MAX_LEN=5`, and train/validation/test length histograms. |
+| `dataset_manifest.json` | Dataset name, authoritative download URL, raw filename, checksum, raw observations, hourly observations, all 370 original attributes, train-only stable-client audit count (expected 155), frequency, time period, `pred_column=MT_235`, target mean/std/min/max/zero count, UCI decimal-comma/DST convention, SVHN train/extra/test counts, excluded six-digit count, Setting A GT-crop geometry, Setting B whole-image geometry with no boxes, resized canvas, sequence vocabulary, `MAX_LEN=5`, duplicate-audit result, and train/validation/test length histograms. |
 | `split_manifest.json` | Exact train/validation/test timestamp boundaries and window counts for Task 1 and Task 2; exact SVHN train+extra train/validation/test image counts and sequence-length counts. Include the formulas `N-L-2+1` and `N-L-5+1` and the realized counts after boundary filtering. |
 | `phase1/task1_model_specs.json` | Title, objective, input shape/window, output shape, architecture diagram data, parameter count, optimizer, learning rate, batch size, epochs, patience, loss, seed list, and checkpoint path for every Task 1 model. |
 | `phase1/task2_model_specs.json` | The same fields for the encoder–decoder models, including teacher-forcing schedule, horizon embeddings, and attention configuration. |
-| `phase1/task3_model_specs.json` | The same fields for cropped CNN-GRU, no-attention GRU, multi-head CNN, and CRNN-CTC models, including GT union-box margin, square/64x64/54x54 geometry, train+extra counts, CNN feature-map size, decoder vocabulary, length head, augmentation, teacher forcing, decoding mode, and parameter count. |
-| `*_metrics_by_seed.csv` | One row per model/seed with R2, NSE, MAE, RMSE and, for Task 3, exact-string accuracy, character accuracy, length accuracy, normalized edit distance. |
+| `phase1/task3_model_specs.json` | The same fields for Setting A and Setting B CNN-GRU, no-attention GRU, multi-head CNN, and CRNN-CTC models, including whether boxes were used, GT union-box margin when applicable, 64x64/54x54 geometry, train+extra counts, CNN feature-map size, decoder vocabulary, length head, augmentation, teacher forcing, validation-selected beam width or MAP rule, checkpoint selection rule, and parameter count. |
+| `*_metrics_by_seed.csv` | One row per model/seed with R2, NSE, MAE, RMSE and, for Task 3, setting, decoding mode/width, exact-string accuracy, character accuracy, length accuracy, normalized edit distance, and both sentinel-aware primary and true-position diagnostic metrics. |
 | `task2_metrics_by_horizon.csv` | One row per model/seed/horizon 1–5 with R2, NSE, MAE, RMSE, plus pooled and macro summaries. |
-| `mamba_ablation_summary.csv` | M0/M1/M2/M3/M4 means, standard deviations, medians, per-seed values, parameter counts, training hours, Phase 1 base protocol, and the pre-registered claim status. |
+| `mamba_ablation_summary.csv` | M0/M1/M2/M3/M4 means, standard deviations, medians, per-seed values, setting, parameter counts, training hours, Phase 1 base protocol, decoder width, and the pre-registered claim status. |
 | `paired_error_differences.csv` | Same-seed per-origin Task 1/2 losses and same-seed per-image Task 3 losses for M0-M1 and M0-M2; include model names, seed, origin/image ID, horizon, true value, prediction, and loss. |
 | `dm_tests.csv` | DM statistic, HAC lag, loss type, raw p-value, Holm-adjusted p-value, contrast, task, and seed-averaging rule. |
 | `bootstrap_confidence_intervals.csv` | 10,000-replicate block/image bootstrap intervals for RMSE, MAE, NSE, exact-string accuracy, and the Mamba contrasts. |
@@ -442,8 +452,8 @@ The code must also export these final report figures as PNG and editable SVG whe
 3. `figures/task1_mamba_ablation.png`: M0/M1/M2/M3/M4 RMSE/MAE with 95% paired intervals.
 4. `figures/task2_horizon_metrics.png`: Task 2 RMSE/MAE/R2/NSE at horizons 1–5 for Phase 1 and Mamba models.
 5. `figures/task2_attention_state_maps.png`: decoder attention and Mamba state/selection diagnostics.
-6. `figures/task3_examples_attention.png`: cropped SVHN input, ground truth, prediction, and per-character attention for correct and failed examples.
-7. `figures/task3_length_errors.png`: exact-string accuracy by sequence length, character/length errors, oracle-crop versus whole-image stress results, and Mamba ablation intervals.
+6. `figures/task3_examples_attention.png`: Setting A and Setting B SVHN input, ground truth, beam/MAP prediction, and per-character attention for correct and failed examples.
+7. `figures/task3_length_errors.png`: Setting A versus Setting B exact-string accuracy by sequence length, character/length errors, oracle-crop versus trained whole-image results, cross-setting stress results, and Mamba ablation intervals.
 8. `figures/compute_accuracy_tradeoff.png`: parameter count, active training time, and primary test metric.
 
 ### Phase 4: report review and revision timeline
@@ -456,6 +466,7 @@ The timeline is: Phase 0 setup; Phase 1 required models and exported tables; Pha
 
 - Bahdanau, D., Cho, K., and Bengio, Y. (2015). *Neural machine translation by jointly learning to align and translate*.
 - Goodfellow, I. J. et al. (2014). *Multi-digit Number Recognition from Street View Imagery using Deep Convolutional Neural Networks*.
+- He, P. et al. (2019). *Deep Learning for Scene Text Recognition*.
 - Bautista, D. C., and Atienza, R. (2021). *Scene Text Recognition with Permuted Autoregressive Sequence Models*.
 - Cho, K. et al. (2014). *Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation*.
 - Cai, X., Wang, X., Zhu, Y., and Yao, Y. (2024). *MambaTS: Improved Selective State Space Models for Long-term Time Series Forecasting*.

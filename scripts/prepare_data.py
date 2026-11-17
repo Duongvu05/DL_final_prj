@@ -3,7 +3,10 @@
 Writes data/processed/{electricity_hourly.npz, electricity_audit.json, svhn/*} and
 results/manifests/{dataset_manifest.json, split_manifest.json, environment.json, checksums.txt}.
 The SVHN cache follows the cropped protocol of configs/phase1_task3.yaml (raw train, extra and
-test folders under data/raw/svhn).
+test folders under data/raw/svhn). With --with-whole it then builds the whole-image cache of
+configs/phase1_task3_whole.yaml from the same records (svhn.prepare_whole, no ground-truth box)
+and adds its counts to split_manifest.json as "task3_whole", with the crop-clipping rates of the
+diagnostic full_border_audit.json (svhn.whole_border_audit).
 """
 
 import argparse
@@ -47,6 +50,11 @@ def main() -> None:
     ap.add_argument("--task3-config", default="configs/phase1_task3.yaml")
     ap.add_argument("--workers", type=int, default=None, help="digitStruct.mat parse processes")
     ap.add_argument("--skip", choices=("electricity", "svhn"), action="append", default=[])
+    ap.add_argument(
+        "--with-whole",
+        action="store_true",
+        help="also build the whole-image SVHN cache (_full suffix) from the cropped cache",
+    )
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text())
     t3 = yaml.safe_load(Path(a.task3_config).read_text())
@@ -72,6 +80,13 @@ def main() -> None:
         )
         counts = {k: v["n_images"] for k, v in audit["splits"].items()}
         logger.info(f"svhn cached in {time.time() - t0:.1f}s: {counts}")
+    if a.with_whole:
+        t0 = time.time()
+        w_audit = svhn.prepare_whole(raw / "svhn", proc / "svhn", size=t3["size"])
+        counts = {k: v["n_images"] for k, v in w_audit["splits"].items()}
+        logger.info(f"svhn whole-image cache in {time.time() - t0:.1f}s: {counts}")
+        # diagnostic only (reads the crop-cache boxes, never feeds the whole-image data path)
+        svhn.whole_border_audit(proc / "svhn", crop=t3["crop"], suffix=w_audit["suffix"])
 
     e_audit = json.loads((proc / "electricity_audit.json").read_text())
     s_audit = json.loads((proc / "svhn" / "svhn_audit.json").read_text())
@@ -87,6 +102,14 @@ def main() -> None:
             "splits": s_audit["splits"],
         }
     }
+    full_audit = proc / "svhn" / "full_audit.json"
+    if full_audit.exists():
+        w_audit = json.loads(full_audit.read_text())
+        if svhn.whole_cache_matches(proc / "svhn", w_audit):
+            border = svhn.load_border_audit(proc / "svhn", w_audit)
+            splits["task3_whole"] = svhn.whole_manifest_entry(w_audit, border)
+        else:
+            logger.warning("whole-image cache is stale (crop records changed), rerun --with-whole")
     npz = proc / "electricity_hourly.npz"
     for t in (1, 2):
         tc = cfg[f"task{t}"]

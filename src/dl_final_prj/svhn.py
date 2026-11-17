@@ -6,12 +6,23 @@ stratified by length. Every image is cropped once to its expanded ground-truth u
 resized to 64x64 (aspect ratio ignored) into a uint8 cache with the Rust extension. The whole
 test images are also letterboxed into 64x64 as a stress-test cache. Training then reads only
 the cache, so no image is decoded during training.
+
+prepare_whole() adds the whole-image setting (He et al. 2019). It reuses the record lists of
+the cropped cache (same images, same order, same train/val/test split) and resizes each WHOLE
+original image to 64x64 (aspect ratio ignored) without any crop, so no ground-truth digit box
+enters its data path. Its files carry the suffix "_full" and are read with
+SvhnSplit(cache, split, suffix="_full").
+
+whole_border_audit() is a separate, diagnostic-only step. It reads the ground-truth boxes of the
+cropped cache once and measures how often the 54x54 crops of SvhnSplit cut digits off a
+stretched whole image. Nothing it computes feeds training or evaluation.
 """
 
 import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -35,6 +46,11 @@ NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
 CROP_EXPAND = 1.3
 SOURCES = ("train", "extra", "test")
+SPLITS = ("train", "val", "test")
+WHOLE_SUFFIX = "_full"
+# suffixes prepare_whole() must never write: "" is the cropped cache itself and "_whole" would
+# clash with the letterbox stress cache test_whole_* of prepare()
+_RESERVED_SUFFIXES = ("", "_whole")
 _BOX_KEYS = ("label", "left", "top", "width", "height")
 
 
@@ -319,6 +335,245 @@ def prepare(
     return audit
 
 
+# --- whole-image setting (no ground-truth box) ----------------------------------------
+
+
+def _label_only(records: list[dict]) -> list[dict]:
+    """Name, folder and digit string of each record. Boxes, crops and geometry are dropped."""
+    return [{"name": r["name"], "dir": r["dir"], "label": r["label"]} for r in records]
+
+
+def whole_manifest_entry(audit: dict, border: dict | None = None) -> dict:
+    """The split_manifest.json entry of the whole-image cache, from its full_audit.json.
+
+    With the matching full_border_audit.json its crop-clipping rates are added under
+    "border_diagnostic" (diagnostic only).
+    """
+    entry = {
+        "rule": audit["whole_rule"],
+        "records": audit["records_rule"],
+        "suffix": audit["suffix"],
+        "n_images": {k: v["n_images"] for k, v in audit["splits"].items()},
+        "length_hist": {k: v["length_hist"] for k, v in audit["splits"].items()},
+    }
+    if border is not None:
+        keys = ("eval_union_clipped_frac", "eval_digit_center_out_frac", "train_union_clipped_prob")
+        entry["border_diagnostic"] = {
+            "file": "full_border_audit.json",
+            "eval_window_px": border["eval_window_px"],
+            "splits": {k: {m: v[m] for m in keys} for k, v in border["splits"].items()},
+        }
+    return entry
+
+
+def whole_cache_matches(cache_dir: Path, audit: dict) -> bool:
+    """True when the whole-image cache was built from the current cropped-cache records."""
+    for name, v in audit["splits"].items():
+        src = Path(cache_dir) / f"{name}_labels.json"
+        if not src.exists() or hashlib.sha256(src.read_bytes()).hexdigest() != v.get(
+            "source_labels_sha256"
+        ):
+            return False
+    return True
+
+
+def check_whole_suffix(suffix: object) -> str:
+    """The suffix of the whole-image cache. Refuses names of the cropped or stress caches.
+
+    With suffix "" prepare_whole() would overwrite {split}_images.npy and {split}_labels.json,
+    the oracle-crop cache, and "_whole" would overwrite the stress cache test_whole_*.
+    """
+    if not isinstance(suffix, str) or suffix in _RESERVED_SUFFIXES:
+        raise ValueError(
+            f"whole-image suffix {suffix!r} would overwrite the cropped or stress cache, "
+            f"use e.g. {WHOLE_SUFFIX!r}"
+        )
+    if not re.fullmatch(r"_[A-Za-z0-9]+", suffix):
+        raise ValueError(f"whole-image suffix {suffix!r} must look like '_full'")
+    return suffix
+
+
+def prepare_whole(
+    raw_dir: Path,
+    cache_dir: Path,
+    size: int = 64,
+    chunk: int = 20000,
+    suffix: str = WHOLE_SUFFIX,
+) -> dict:
+    """Build the whole-image cache next to the cropped cache. Returns the audit dict.
+
+    The records come from cache_dir/{train,val,test}_labels.json written by prepare(), so
+    both settings use the same images, order and split. Only name, folder and label are kept
+    from them. Each whole original image is resized to size x size RGB with the aspect ratio
+    ignored (stretch), with no crop. Writes {split}{suffix}_images.npy,
+    {split}{suffix}_labels.json and full_audit.json.
+    """
+    check_whole_suffix(suffix)
+    raw_dir, cache_dir = Path(raw_dir), Path(cache_dir)
+    summary = {}
+    t_all = time.time()
+    for name in SPLITS:
+        src = cache_dir / f"{name}_labels.json"
+        if not src.exists():
+            raise FileNotFoundError(f"{src} missing: build the cropped cache with prepare() first")
+        recs = _label_only(json.loads(src.read_text()))
+        logger.info(f"whole {name}: {len(recs)} images from {src.name}")
+        paths = [str(raw_dir / r["dir"] / r["name"]) for r in recs]
+        out = cache_dir / f"{name}{suffix}_images.npy"
+        geom = _write_cache(out, paths, size, None, True, [0, 0, 0], chunk)
+        rows = [
+            r | {"geometry": [round(float(v), 5) for v in g]}
+            for r, g in zip(recs, geom, strict=True)
+        ]
+        (cache_dir / f"{name}{suffix}_labels.json").write_text(json.dumps(rows))
+        summary[name] = {
+            "n_images": len(recs),
+            "by_source": {s: c for s in SOURCES if (c := sum(r["dir"] == s for r in recs))},
+            "length_hist": length_hist([r["label"] for r in recs]),
+            "source_labels_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+            "source_width_px_pct_5_50_95": np.percentile(geom[:, 0], [5, 50, 95]).tolist()
+            if recs
+            else None,
+            "source_height_px_pct_5_50_95": np.percentile(geom[:, 1], [5, 50, 95]).tolist()
+            if recs
+            else None,
+        }
+    audit = {
+        "setting": "whole image, no ground-truth box (He et al. 2019 style)",
+        "suffix": suffix,
+        "records_rule": (
+            "records of the cropped cache {split}_labels.json, same images, order and "
+            "train/val/test assignment. Only name, folder and digit string are read"
+        ),
+        "whole_rule": (
+            f"whole original image decoded as RGB and resized to {size}x{size} ignoring the "
+            "aspect ratio (stretch, bilinear/triangle). No crop and no digit box is used, "
+            "for training, validation and test alike"
+        ),
+        "boxes_used": False,
+        "train_crop": "random 54x54 crop of the 64x64 cache plus ColorJitter (training only)",
+        "eval_crop": (
+            "center 54x54 crop. A stretched whole image has no margin around the digits, so "
+            "this crop can cut digits near the border. full_border_audit.json measures how often"
+        ),
+        "normalization": {"mean": list(NORM_MEAN), "std": list(NORM_STD), "scale": "x / 255"},
+        "canvas": [size, size, 3],
+        "files": {k: [f"{k}{suffix}_images.npy", f"{k}{suffix}_labels.json"] for k in SPLITS},
+        "splits": summary,
+    }
+    (cache_dir / "full_audit.json").write_text(json.dumps(audit, indent=2))
+    logger.info(f"whole-image cache written in {time.time() - t_all:.0f}s")
+    return audit
+
+
+def _union_ltrb(boxes: Sequence[Sequence[float]], w: float, h: float) -> np.ndarray:
+    """Digit boxes [[left, top, width, height]] clamped to the image -> (n, 4) as l, t, r, b."""
+    b = np.asarray(boxes, np.float64).reshape(-1, 4)
+    ltrb = np.stack([b[:, 0], b[:, 1], b[:, 0] + b[:, 2], b[:, 1] + b[:, 3]], 1)
+    return np.clip(ltrb, 0, [w, h, w, h])
+
+
+def _fits(lo: float, hi: float, crop: int, margin: int) -> int:
+    """Number of integer offsets o in 0..margin with o <= lo and hi <= o + crop."""
+    first, last = max(0, math.ceil(hi - crop)), min(margin, math.floor(lo))
+    return max(0, last - first + 1)
+
+
+def whole_border_audit(cache_dir: Path, crop: int = 54, suffix: str = WHOLE_SUFFIX) -> dict:
+    """DIAGNOSTIC ONLY: how often the 54x54 crops of SvhnSplit cut digits off whole images.
+
+    Not part of the whole-image data path: it reads the ground-truth digit boxes of the
+    cropped cache ({split}_labels.json) once, maps them through the stretch geometry of
+    {split}{suffix}_labels.json onto the size x size canvas and writes full_border_audit.json.
+    Its numbers explain part of the gap between the two settings and must never be used to
+    choose a model, a margin or a decoding on test.
+
+    Per split it reports
+      eval_union_clipped_frac      union box not inside the center window [m, m + crop)
+      eval_digit_center_out_frac   some digit's center outside that window (digit mostly lost)
+      train_union_clipped_prob     mean probability that the random training crop clips the
+                                   union box (uniform integer offsets 0..size-crop per axis)
+    where m = (size - crop) // 2, as in SvhnSplit.batch.
+    """
+    check_whole_suffix(suffix)
+    cache_dir = Path(cache_dir)
+    full_audit = json.loads((cache_dir / "full_audit.json").read_text())
+    size = int(full_audit["canvas"][0])
+    margin = size - crop
+    if margin < 0:
+        raise ValueError(f"crop {crop} does not fit the {size}px cache")
+    lo, hi = margin // 2, margin // 2 + crop
+    out: dict[str, dict] = {}
+    for name in SPLITS:
+        src = cache_dir / f"{name}_labels.json"
+        crop_recs = json.loads(src.read_text())
+        full_recs = json.loads((cache_dir / f"{name}{suffix}_labels.json").read_text())
+        if [(r["dir"], r["name"]) for r in crop_recs] != [(r["dir"], r["name"]) for r in full_recs]:
+            raise ValueError(f"{name}: whole-image cache does not follow {src.name}, rebuild it")
+        clipped, center_out, train_p, overhang = [], [], [], []
+        for cr, fr in zip(crop_recs, full_recs, strict=True):
+            w, h = float(fr["geometry"][0]), float(fr["geometry"][1])
+            d = _union_ltrb(cr["boxes"], w, h) * [size / w, size / h, size / w, size / h]
+            u = [d[:, 0].min(), d[:, 1].min(), d[:, 2].max(), d[:, 3].max()]
+            over = max(lo - u[0], lo - u[1], u[2] - hi, u[3] - hi, 0.0)
+            clipped.append(over > 0)
+            overhang.append(over)
+            cx, cy = (d[:, 0] + d[:, 2]) / 2, (d[:, 1] + d[:, 3]) / 2
+            center_out.append(bool(((cx < lo) | (cx >= hi) | (cy < lo) | (cy >= hi)).any()))
+            ok = _fits(u[0], u[2], crop, margin) * _fits(u[1], u[3], crop, margin)
+            train_p.append(1.0 - ok / (margin + 1) ** 2)
+        n = len(crop_recs)
+        over_c = [o for o, c in zip(overhang, clipped, strict=True) if c]
+        out[name] = {
+            "n_images": n,
+            "eval_union_clipped_frac": float(np.mean(clipped)) if n else None,
+            "eval_digit_center_out_frac": float(np.mean(center_out)) if n else None,
+            "train_union_clipped_prob": float(np.mean(train_p)) if n else None,
+            "overhang_px_pct_50_95_of_clipped": np.percentile(over_c, [50, 95]).tolist()
+            if over_c
+            else None,
+            "source_labels_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+        }
+        logger.info(
+            f"border diagnostic {name}: union clipped by the eval crop in "
+            f"{out[name]['eval_union_clipped_frac']}, a digit center outside in "
+            f"{out[name]['eval_digit_center_out_frac']}"
+        )
+    audit = {
+        "purpose": (
+            "diagnostic only, not part of the whole-image data path. Ground-truth boxes of the "
+            "cropped cache are read here once to measure how often the fixed 54x54 crops cut "
+            "digits off the stretched whole images. Never used for training, selection or test "
+            "decisions"
+        ),
+        "suffix": suffix,
+        "canvas": size,
+        "crop": crop,
+        "eval_window_px": [lo, hi],
+        "box_rule": (
+            "digit boxes clamped to the original image, scaled by (size / width, size / height) "
+            "as the stretch resize, union over the digits of a number"
+        ),
+        "splits": out,
+    }
+    (cache_dir / "full_border_audit.json").write_text(json.dumps(audit, indent=2))
+    return audit
+
+
+def load_border_audit(cache_dir: Path, audit: dict) -> dict | None:
+    """full_border_audit.json when it matches the whole-image cache of `audit` and the
+    current cropped records, else None."""
+    path = Path(cache_dir) / "full_border_audit.json"
+    if not path.exists() or not whole_cache_matches(cache_dir, audit):
+        return None
+    border = json.loads(path.read_text())
+    same = border.get("suffix") == audit["suffix"] and all(
+        border["splits"].get(k, {}).get("source_labels_sha256") == v["source_labels_sha256"]
+        for k, v in audit["splits"].items()
+    )
+    return border if same else None
+
+
 # --- training-time access -----------------------------------------------------------
 
 
@@ -375,6 +630,9 @@ def color_jitter(x: torch.Tensor, factors: torch.Tensor) -> torch.Tensor:
 class SvhnSplit:
     """One cached split held on the device as (N, 3, size, size) uint8.
 
+    Reads {split}{suffix}_images.npy and {split}{suffix}_labels.json. The default suffix ""
+    is the cropped cache, suffix "_full" the whole-image cache of prepare_whole().
+
     Training batches take a random crop per image and apply ColorJitter on the device,
     evaluation batches take the center crop. All random numbers come from the CPU
     generator passed in, so a resumed epoch sees exactly the same augmentation.
@@ -389,9 +647,10 @@ class SvhnSplit:
         crop: int = 54,
         jitter: float = 0.3,
         limit: int | None = None,
+        suffix: str = "",
     ) -> None:
-        imgs = np.load(Path(cache_dir) / f"{split}_images.npy", mmap_mode="r")
-        records = json.loads((Path(cache_dir) / f"{split}_labels.json").read_text())
+        imgs = np.load(Path(cache_dir) / f"{split}{suffix}_images.npy", mmap_mode="r")
+        records = json.loads((Path(cache_dir) / f"{split}{suffix}_labels.json").read_text())
         if limit is not None:
             imgs, records = imgs[:limit], records[:limit]
         self.split, self.records = split, records

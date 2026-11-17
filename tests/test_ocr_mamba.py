@@ -24,7 +24,13 @@ from dl_final_prj.ocr_mamba import (
     MixerAttentionGRURecognizer,
     VisionBiMamba,
 )
-from dl_final_prj.ocr_models import AttentionGRURecognizer, build
+from dl_final_prj.ocr_models import (
+    BEAM_WIDTHS,
+    AttentionGRURecognizer,
+    build,
+    primary_mode,
+    search_widths,
+)
 from dl_final_prj.svhn import MAX_LEN, decode, prepare
 from dl_final_prj.ts_models import count_params
 from test_svhn import ocr_batch, write_raw
@@ -74,12 +80,13 @@ def test_shapes_backward_and_decoding_modes(name):
     assert not missing
     model.eval()
     with torch.no_grad():
-        assert model.modes == ("greedy", "length", "beam3")
+        assert model.modes == ("greedy", "length", "beam3", "beam5", "beam10")
+        assert primary_mode(model, 5) == "beam5" and search_widths(model) == BEAM_WIDTHS
         for mode in model.modes:
             preds, aux = model.predict(b.images, mode)
             assert len(preds) == 3 and all(p.isdigit() for p in preds)
             assert all(1 <= len(p) <= MAX_LEN for p in preds)
-            if mode == "greedy":
+            if mode != "length":  # greedy and every beam width return their attention
                 torch.testing.assert_close(aux["attention"].sum(-1), torch.ones(3, 6))
 
 
@@ -91,8 +98,13 @@ def test_length_constraint_and_beam_width_one(name):
         want = torch.tensor([1, 2, 3, 4, 5])
         ids, _ = model.greedy(b.images, constrain=True, lengths=want)
         assert [len(decode(s)) for s in ids.tolist()] == want.tolist()
-        greedy, _ = model.predict(b.images, "greedy")
-        assert [decode(s) for s in model.beam(b.images, 1).tolist()] == greedy
+        greedy, aux = model.predict(b.images, "greedy")
+        ids, att = model.beam(b.images, 1)
+        assert [decode(s) for s in ids.tolist()] == greedy
+        torch.testing.assert_close(att, aux["attention"])
+        ids5, att5 = model.beam(b.images, 5)
+        _, _, forced = model(b.images, ids5)  # the attention of the chosen beam
+        torch.testing.assert_close(att5, forced, atol=1e-5, rtol=1e-4)
 
 
 def test_parameter_counts_match_m0_within_5_percent():
@@ -356,10 +368,10 @@ def cache(tmp_path_factory):
     return tmp / "cache"
 
 
-def run_ocr(model: str, cache: Path, out: Path, config: Path, smoke: bool = True):
+def run_ocr(model: str, cache: Path, out: Path, config: Path, *extra: str, smoke: bool = True):
     env = os.environ | {"CUDA_VISIBLE_DEVICES": ""}
     cmd = [sys.executable, "scripts/run_ocr.py", "--model", model, "--seed", "0"]
-    cmd += ["--config", str(config), "--cache", str(cache), "--out", str(out)]
+    cmd += ["--config", str(config), "--cache", str(cache), "--out", str(out), *extra]
     cmd += ["--smoke"] if smoke else []
     return subprocess.run(cmd, check=True, cwd=ROOT, env=env, capture_output=True, text=True)
 
@@ -371,8 +383,12 @@ def test_run_ocr_smoke(model, cache, tmp_path):
     metrics = json.loads((run / "metrics.json").read_text())
     spec = json.loads((run / "spec.json").read_text())
     history = json.loads((run / "history.json").read_text())
-    want = {"val", "test", "test_length_constrained", "test_beam3", "test_whole"}
-    assert set(metrics) == want
+    want = {"val", "test", "val_greedy", "test_greedy", "test_length_constrained"}
+    want |= {"test_whole", "test_whole_greedy"}
+    assert set(metrics) == want | {"decoding"}
+    dec = metrics["decoding"]
+    assert dec["primary"] == "beam" and set(dec["val_by_width"]) == {"3", "5", "10"}
+    assert metrics["val"]["exact_match"] == dec["val_by_width"][str(dec["width"])]
     assert len(history) == 2 and spec["epochs_run"] == 2
     assert (
         spec["n_params"] == N_PARAMS[model] == spec["architecture"]["n_params_breakdown"]["total"]
@@ -386,11 +402,23 @@ def test_run_ocr_smoke(model, cache, tmp_path):
     assert spec["architecture"]["decoder_token_dim"] == 256
     assert spec["architecture"]["position_embeddings"].startswith("learned row/col")
     assert set(spec["decoding_modes"]) == want
+    assert spec["decoding"]["mode"] == dec["mode"] == f"beam{dec['width']}"
     for key in want:
         preds = json.loads((run / f"pred_{key}.json").read_text())
-        assert len(preds) == spec["n_images"]["val" if key == "val" else "test"]
-    att = np.load(run / "attention_test.npz")["attention"]
-    assert att.shape == (12, 6, 49)
+        n = spec["n_images"]["val" if key.startswith("val") else "test"]
+        assert len(preds) == n and all(len(r["pred"]) <= MAX_LEN for r in preds)
+    att = np.load(run / "attention_test.npz")
+    assert att["attention"].shape == att["attention_greedy"].shape == (12, 6, 49)
+    assert str(att["mode"]) == dec["mode"]
+    # --eval-only from ckpt.pt gives the same evaluation and leaves the checkpoint alone
+    ck = (run / "ckpt.pt").read_bytes()
+    out = run_ocr(model, cache, tmp_path, ROOT / "configs" / "phase2_task3.yaml", "--eval-only")
+    assert "test (beam" in out.stderr and (run / "ckpt.pt").read_bytes() == ck
+    again = json.loads((run / "metrics.json").read_text())
+    assert {k: v for k, v in again.items() if k != "decoding"} == {
+        k: v for k, v in metrics.items() if k != "decoding"
+    }
+    assert again["decoding"]["val_by_width"] == dec["val_by_width"]
     has_dt = (run / "mamba_dt_test.npz").exists()
     assert has_dt == (model == "t3_m0")
     if model == "t3_m0":

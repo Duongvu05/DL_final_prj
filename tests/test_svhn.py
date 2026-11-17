@@ -1,18 +1,26 @@
+import hashlib
+import importlib.util
+import itertools
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
 import pytest
 import torch
+import yaml
 from PIL import Image
 
 from dl_final_prj import fast
 from dl_final_prj.metrics import per_sample_losses, sequence_report
 from dl_final_prj.ocr_models import (
+    BEAM_WIDTHS,
     AttentionGRURecognizer,
     CTCRecognizer,
     MultiHeadCNN,
@@ -20,6 +28,11 @@ from dl_final_prj.ocr_models import (
     build,
     ctc_greedy,
     ctc_loss,
+    ctc_prefix_beam,
+    ctc_prefix_beam_one,
+    multihead_map,
+    primary_mode,
+    select_width,
     tokens_to_ctc_targets,
 )
 from dl_final_prj.svhn import (
@@ -375,13 +388,35 @@ def test_beam_width_one_equals_greedy(kind):
     b = ocr_batch(["1"] * 8, seed=3)
     with torch.no_grad():
         greedy, aux = m.predict(b.images, "greedy")
-        assert [decode(s) for s in m.beam(b.images, 1).tolist()] == greedy
-        beam3, _ = m.predict(b.images, "beam3")
-    assert len(beam3) == 8 and all(len(p) <= MAX_LEN for p in beam3)
+        ids1, att1 = m.beam(b.images, 1)
+        assert [decode(s) for s in ids1.tolist()] == greedy
+        assert m.predict(b.images, "beam1")[0] == greedy
+        for w in BEAM_WIDTHS:
+            preds, aux_w = m.predict(b.images, f"beam{w}")
+            assert len(preds) == 8 and all(p.isdigit() and 1 <= len(p) <= MAX_LEN for p in preds)
+            assert ("attention" in aux_w) == (kind == "attention")
     if kind == "attention":
         att = aux["attention"]
         assert att.shape == (8, 6, 49)
         torch.testing.assert_close(att.sum(-1), torch.ones(8, 6))
+        torch.testing.assert_close(att1, att)  # the best beam's weights, here the greedy path
+        att10 = aux_w["attention"]
+        assert att10.shape == (8, 6, 49)
+        torch.testing.assert_close(att10.sum(-1), torch.ones(8, 6))
+    else:
+        assert att1 is None and "attention" not in aux
+
+
+def test_beam_attention_follows_the_chosen_beam():
+    """The attention returned by beam search is the one recomputed by a teacher-forced pass
+    over the chosen sequence (the decoder is deterministic in eval mode)."""
+    torch.manual_seed(4)
+    m = build("attention").eval()
+    b = ocr_batch(["1"] * 6, seed=5)
+    with torch.no_grad():
+        ids, att = m.beam(b.images, 5)
+        _, _, forced = m(b.images, ids)
+    torch.testing.assert_close(att, forced, atol=1e-5, rtol=1e-4)
 
 
 def test_beam_search_finds_a_better_sequence_than_greedy():
@@ -409,7 +444,7 @@ def test_beam_search_finds_a_better_sequence_than_greedy():
         assert m.predict(x, "beam3")[0] == ["2"]
 
 
-@pytest.mark.parametrize("mode", ["greedy", "beam1", "beam3"])
+@pytest.mark.parametrize("mode", ["greedy", "beam1", "beam3", "beam5", "beam10"])
 def test_unconstrained_decoding_stops_at_max_len(mode):
     """A decoder that never prefers EOS still outputs at most MAX_LEN digits: EOS is forced
     at the last step."""
@@ -426,8 +461,309 @@ def test_unconstrained_decoding_stops_at_max_len(mode):
     with torch.no_grad():
         preds, _ = m.predict(torch.zeros(2, 3, 54, 54), mode)
     assert all(len(p) == MAX_LEN for p in preds)
-    if mode != "beam3":
+    if mode in ("greedy", "beam1"):
         assert preds == ["1" * MAX_LEN] * 2
+
+
+def test_beam_beats_greedy_for_every_width():
+    """The hand-made decoder of test_beam_search_finds_a_better_sequence_than_greedy, read
+    through the primary-mode helper for every candidate width."""
+    m = build("pooled").eval()
+
+    def step(prev, h, feats, kp, mean):
+        logits = torch.full((len(prev), 13), -30.0)
+        for i, p in enumerate(prev.tolist()):
+            if p == 1:  # SOS: digit 1 (0.5) slightly ahead of digit 2 (0.45)
+                logits[i, 4], logits[i, 5] = math.log(0.5), math.log(0.45)
+            elif p == 4:  # after 1 the model is unsure
+                logits[i, EOS], logits[i, 3], logits[i, 6] = (math.log(x) for x in (0.3, 0.3, 0.4))
+            else:  # after 2 (and after EOS) it is sure about EOS
+                logits[i, EOS] = 0.0
+        return logits, h, None
+
+    m.step = step  # type: ignore[method-assign]
+    x = torch.zeros(2, 3, 54, 54)
+    with torch.no_grad():
+        assert m.predict(x, "greedy")[0] == ["13"] * 2
+        for w in BEAM_WIDTHS:
+            assert m.predict(x, primary_mode(m, w))[0] == ["2"] * 2
+
+
+def ctc_logits(probs: list[dict[int, float]]) -> torch.Tensor:
+    """(1, T, 11) logits whose softmax is the given class probabilities (others ~0)."""
+    x = torch.full((1, len(probs), 11), -50.0)
+    for t, row in enumerate(probs):
+        for c, p in row.items():
+            x[0, t, c] = math.log(p)
+    return x
+
+
+def test_ctc_prefix_beam_merges_repeats_only_without_a_blank():
+    one_one = ctc_logits([{2: 0.9, 0: 0.1}, {0: 0.9, 2: 0.1}, {2: 0.9, 0: 0.1}])  # 1 _ 1
+    one = ctc_logits([{2: 0.9, 0: 0.1}, {2: 0.9, 0: 0.1}, {0: 0.9, 2: 0.1}])  # 1 1 _
+    for w in (1, *BEAM_WIDTHS):
+        assert ctc_prefix_beam(one_one, w) == ["11"]
+        assert ctc_prefix_beam(one, w) == ["1"]
+    # exact prefix probabilities of "1 1 _": "1" collects 1-1-_, 1-_-_, _-1-_, 1-1-1, ...
+    ranked = dict(ctc_prefix_beam_one(one.log_softmax(-1)[0].tolist(), 10))
+    p_one = sum(
+        math.prod(row[c] for row, c in zip([[0.1, 0, 0.9]] * 2 + [[0.9, 0, 0.1]], path))
+        for path in itertools.product((0, 2), repeat=3)
+        if ctc_greedy(torch.tensor([[[0.0 if k == c else -9.0 for k in range(11)] for c in path]]))
+        == ["1"]
+    )
+    assert math.exp(ranked[(2,)]) == pytest.approx(p_one, rel=1e-4)
+
+
+def test_ctc_prefix_beam_sums_paths_and_beats_best_path():
+    """Per step: blank 0.4, digit 1 0.35, digit 2 0.25. The best path is blank-blank (""),
+    but "1" collects 1-1, 1-_ and _-1 (0.4025)."""
+    logits = ctc_logits([{0: 0.4, 2: 0.35, 3: 0.25}] * 2)
+    assert ctc_greedy(logits) == [""]
+    for w in BEAM_WIDTHS:
+        assert ctc_prefix_beam(logits, w) == ["1"]
+    ranked = ctc_prefix_beam_one(logits.log_softmax(-1)[0].tolist(), 10)
+    probs = {k: math.exp(v) for k, v in ranked}
+    assert probs[(2,)] == pytest.approx(0.35**2 + 2 * 0.35 * 0.4, rel=1e-4)
+    assert probs[()] == pytest.approx(0.16, rel=1e-4)
+    assert sum(probs.values()) == pytest.approx(1.0, rel=1e-4)  # T=2: all prefixes survive
+
+
+def test_ctc_prefix_beam_equals_best_path_when_one_path_dominates():
+    g = torch.Generator().manual_seed(0)
+    checked = 0
+    for _ in range(60):
+        path = torch.where(
+            torch.rand(14, generator=g) < 0.6, 0, torch.randint(1, 11, (14,), generator=g)
+        )
+        logits = torch.full((1, 14, 11), -12.0)
+        logits[0, torch.arange(14), path] = 0.0
+        best = ctc_greedy(logits)
+        if len(best[0]) > MAX_LEN:
+            continue
+        checked += 1
+        for w in (1, *BEAM_WIDTHS):
+            assert ctc_prefix_beam(logits, w) == best
+    assert checked > 20
+
+
+def test_ctc_prefix_beam_returns_at_most_max_len_digits():
+    path = [2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0]  # best path reads 7 digits
+    logits = torch.full((1, 14, 11), -6.0)
+    logits[0, torch.arange(14), torch.tensor(path)] = 0.0
+    assert len(ctc_greedy(logits)[0]) == 7
+    logp = logits.log_softmax(-1)[0].tolist()
+    for w in BEAM_WIDTHS:
+        out = ctc_prefix_beam(logits, w)[0]
+        assert out.isdigit() and len(out) <= MAX_LEN
+        assert out != "12345"  # not the best path cut to MAX_LEN, a scored prefix instead
+        ranked = ctc_prefix_beam_one(logp, w, MAX_LEN)
+        assert all(len(k) <= MAX_LEN for k, _ in ranked)  # long prefixes take no slot
+        assert out == "".join(str(c - 1) for c in ranked[0][0])
+    m = CTCRecognizer().eval()
+    with torch.no_grad():
+        for mode in m.modes:
+            preds, _ = m.predict(torch.randn(3, 3, 54, 54), mode)
+            if mode != "greedy":
+                assert all(len(p) <= MAX_LEN for p in preds)
+
+
+def test_ctc_prefix_beam_with_max_len_is_the_brute_force_best_short_prefix():
+    """With a wide beam the result is the most probable prefix of at most max_len labels,
+    computed by summing every path (exact, since longer prefixes never feed shorter ones)."""
+    g = torch.Generator().manual_seed(3)
+    for _ in range(60):
+        t = int(torch.randint(2, 7, (1,), generator=g))
+        c = int(torch.randint(2, 5, (1,), generator=g))
+        max_len = int(torch.randint(1, 3, (1,), generator=g))
+        logp = torch.randn(t, c, generator=g).mul(2).log_softmax(-1)
+        total: dict[tuple[int, ...], float] = {}
+        for path in itertools.product(range(c), repeat=t):
+            labels = tuple(k for i, k in enumerate(path) if k and (i == 0 or path[i - 1] != k))
+            p = math.exp(sum(logp[i, k].item() for i, k in enumerate(path)))
+            total[labels] = total.get(labels, 0.0) + p
+        short = {k: v for k, v in total.items() if len(k) <= max_len}
+        want = max(short, key=lambda k: short[k])
+        ranked = ctc_prefix_beam_one(logp.tolist(), 10_000, max_len)
+        assert ranked[0][0] == want
+        assert math.isclose(math.exp(ranked[0][1]), short[want], rel_tol=1e-9)
+        assert all(len(k) <= max_len for k, _ in ranked)
+
+
+def test_multihead_map_differs_from_the_length_argmax():
+    """p(L) = (0.35, 0.40, 0.25), head 0 is sure (0.99), head 1 is not (0.5). The length
+    argmax reads 2 digits (0.40 * 0.99 * 0.5 = 0.198), the joint MAP reads 1 (0.3465)."""
+    length = torch.log(torch.tensor([[0.35, 0.40, 0.25, 1e-9, 1e-9]]))
+    digits = torch.full((1, 5, 10), -30.0)
+    digits[0, 0, 7] = math.log(0.99)
+    digits[0, 0, 1] = math.log(0.01)
+    digits[0, 1, 3], digits[0, 1, 4] = math.log(0.5), math.log(0.5) - 1e-4
+    for i in range(2, 5):
+        digits[0, i, 0] = 0.0
+    lengths, best = multihead_map(length, digits)
+    assert lengths.tolist() == [1] and best[0, 0].item() == 7
+    m = MultiHeadCNN().eval()
+    m.forward = lambda images: (length, digits)  # type: ignore[method-assign]
+    assert m.predict(torch.zeros(1), "greedy")[0] == ["73"]
+    assert m.predict(torch.zeros(1), "map")[0] == ["7"]
+
+
+def test_multihead_map_is_the_brute_force_joint_argmax():
+    g = torch.Generator().manual_seed(1)
+    length = torch.randn(4, 3, generator=g) * 2
+    digits = torch.randn(4, 3, 10, generator=g) * 2
+    lengths, best = multihead_map(length, digits)
+    lp_len, lp_dig = length.log_softmax(-1), digits.log_softmax(-1)
+    for b in range(4):
+        score = {
+            seq: lp_len[b, len(seq) - 1].item()
+            + sum(lp_dig[b, i, d].item() for i, d in enumerate(seq))
+            for n in range(1, 4)
+            for seq in itertools.product(range(10), repeat=n)
+        }
+        want = max(score, key=lambda k: score[k])
+        assert (lengths[b].item(), tuple(best[b, : lengths[b]].tolist())) == (len(want), want)
+
+
+def test_select_width_uses_exact_match_and_prefers_the_smaller_width():
+    assert select_width({3: 0.5, 5: 0.6, 10: 0.6}) == 5
+    assert select_width({10: 0.7, 3: 0.7, 5: 0.6}) == 3
+    assert select_width({3: 0.1, 5: 0.2, 10: 0.3}) == 10
+    with pytest.raises(ValueError):
+        select_width({})
+
+
+def load_run_ocr():
+    spec = importlib.util.spec_from_file_location("run_ocr", ROOT / "scripts" / "run_ocr.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class FakeSplit:
+    def __init__(self, name: str, labels: list[str]) -> None:
+        self.name, self.labels = name, labels
+        self.records = [
+            {"name": f"{i}.png", "dir": "test", "label": s} for i, s in enumerate(labels)
+        ]
+
+    def iterate(self, bs: int):
+        yield SimpleNamespace(images=self.name)
+
+
+def test_width_is_selected_on_validation_and_never_on_test():
+    """val prefers width 5 (tie with 10, smaller wins), test would prefer 10. The reported
+    test result must use width 5, and every val decode must come before the first test one."""
+    run_ocr = load_run_ocr()
+    labels = ["12", "345", "6", "78"]
+    right = {"val": labels, "test": labels, "test_whole": labels}
+    wrong = {k: ["9"] * 4 for k in right}
+    table = {
+        ("val", "prefix3"): [*labels[:2], "9", "9"],
+        ("val", "prefix5"): labels,
+        ("val", "prefix10"): labels,
+        ("test", "prefix10"): labels,
+    }
+    calls = []
+    model = CTCRecognizer()
+
+    def fake_predict(images, mode):
+        calls.append((images, mode))
+        return table.get((images, mode), (right if mode == "greedy" else wrong)[images]), {}
+
+    model.predict = fake_predict  # type: ignore[method-assign]
+    data = {s: FakeSplit(s, labels) for s in ("val", "test", "test_whole")}
+    metrics, _, att = run_ocr.evaluate(model, data, "test_whole", 8, False, keep_attention=False)
+    dec = metrics["decoding"]
+    assert dec["primary"] == "ctc_prefix_beam" and dec["width"] == 5 and dec["mode"] == "prefix5"
+    assert dec["val_by_width"] == {"3": 0.5, "5": 1.0, "10": 1.0}
+    assert dec["stress"] == {"split": "test_whole", "mode": "prefix5", "width": 5}
+    assert metrics["val"]["exact_match"] == 1.0 and metrics["test"]["exact_match"] == 0.0
+    assert metrics["test_greedy"]["exact_match"] == 1.0
+    first_test = next(i for i, c in enumerate(calls) if c[0] != "val")
+    assert all(c[0] == "val" for c in calls[:first_test])
+    assert {m for s, m in calls if s != "val"} == {"prefix5", "greedy"}
+    assert set(metrics) == {
+        "val", "val_greedy", "test", "test_greedy", "test_whole", "test_whole_greedy", "decoding"
+    }  # fmt: skip
+    assert att is None
+
+
+GRU_MODELS = ("cnn_attention_gru", "cnn_pool_gru")
+PRIMARY = {
+    "cnn_attention_gru": "beam",
+    "cnn_pool_gru": "beam",
+    "multihead_cnn": "map",
+    "crnn_ctc": "ctc_prefix_beam",
+    "crnn_ctc_whole": "ctc_prefix_beam",
+}
+
+
+def smoke_cmd(model: str, cache: Path, out: Path, *extra: str, config: Path | None = None):
+    cmd = [sys.executable, "scripts/run_ocr.py", "--model", model, "--seed", "0", "--smoke"]
+    cmd += ["--cache", str(cache), "--out", str(out), *extra]
+    return cmd + (["--config", str(config)] if config else [])
+
+
+def check_run(run: Path, model: str, stress: str | None = "test_whole") -> dict:
+    """Shared checks of a Task 3 run directory written by the current decoding."""
+    metrics = json.loads((run / "metrics.json").read_text())
+    spec = json.loads((run / "spec.json").read_text())
+    gru = model in GRU_MODELS
+    reports = {"val", "test", "val_greedy", "test_greedy"}
+    reports |= {"test_length_constrained"} if gru else set()
+    reports |= {stress, f"{stress}_greedy"} if stress else set()
+    assert set(metrics) == reports | {"decoding"}
+    dec = metrics["decoding"]
+    assert dec["primary"] == PRIMARY[model] and spec["decoding"]["primary"] == PRIMARY[model]
+    if PRIMARY[model] == "map":
+        assert dec["width"] is None and dec["val_by_width"] == {} and dec["mode"] == "map"
+    else:
+        assert set(dec["val_by_width"]) == {"3", "5", "10"} and dec["width"] in (3, 5, 10)
+        best = max(dec["val_by_width"].values())
+        assert dec["width"] == min(w for w in (3, 5, 10) if dec["val_by_width"][str(w)] == best)
+        assert metrics["val"]["exact_match"] == dec["val_by_width"][str(dec["width"])]
+        assert dec["mode"].endswith(str(dec["width"]))
+    assert dec["stress"] == (
+        {"split": stress, "mode": dec["mode"], "width": dec["width"]} if stress else None
+    )
+    assert set(spec["decoding_modes"]) == reports
+    assert "greedy" in spec["selection"] and "training-time" in spec["selection"]
+    for key in reports:
+        preds = json.loads((run / f"pred_{key}.json").read_text())
+        split = (
+            "val"
+            if key.startswith("val")
+            else (stress if stress and key.startswith(stress) else "test")
+        )
+        assert len(preds) == spec["n_images"][split]
+        assert (
+            sequence_report([r["target"] for r in preds], [r["pred"] for r in preds])
+            == metrics[key]
+        )
+    if PRIMARY[model] != "map":  # beam outputs never exceed MAX_LEN
+        assert all(
+            len(r["pred"]) <= MAX_LEN for r in json.loads((run / "pred_test.json").read_text())
+        )
+    assert (run / "attention_test.npz").exists() == (model == "cnn_attention_gru")
+    if model == "cnn_attention_gru":
+        att = np.load(run / "attention_test.npz")
+        assert (
+            att["attention"].shape
+            == att["attention_greedy"].shape
+            == (spec["n_images"]["test"], 6, 49)
+        )
+        assert str(att["mode"]) == dec["mode"]
+    return metrics
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def strip_seconds(m: dict) -> dict:
+    return m | {"decoding": {k: v for k, v in m["decoding"].items() if k != "seconds"}}
 
 
 def test_end_to_end_prepare_and_smoke_runs(tmp_path):
@@ -436,20 +772,16 @@ def test_end_to_end_prepare_and_smoke_runs(tmp_path):
     prepare(raw, cache, size=64, workers=1)
     env = os.environ | {"CUDA_VISIBLE_DEVICES": ""}
     for model in ("cnn_attention_gru", "cnn_pool_gru", "multihead_cnn", "crnn_ctc"):
-        cmd = [sys.executable, "scripts/run_ocr.py", "--model", model, "--seed", "0", "--smoke"]
-        cmd += ["--cache", str(cache), "--out", str(tmp_path / "results")]
+        cmd = smoke_cmd(model, cache, tmp_path / "results")
         subprocess.run(cmd, check=True, cwd=ROOT, env=env, capture_output=True, text=True)
         run = tmp_path / "results" / "smoke" / "runs" / "task3" / model / "seed0"
-        metrics = json.loads((run / "metrics.json").read_text())
         spec = json.loads((run / "spec.json").read_text())
         history = json.loads((run / "history.json").read_text())
-        gru = model in ("cnn_attention_gru", "cnn_pool_gru")
-        want = {"val", "test", "test_whole"} | (
-            {"test_length_constrained", "test_beam3"} if gru else set()
-        )
-        assert set(metrics) == want
+        gru = model in GRU_MODELS
+        metrics = check_run(run, model)
         assert len(history) == 2 and spec["epochs_run"] == 2 and spec["n_params"] > 0
         assert spec["n_images"] == {"train": 74, "val": 6, "test": 12, "test_whole": 12}
+        assert spec["setting"] == "oracle_crop" and spec["cache_suffix"] == ""
         by_src = spec["n_images_by_source"]
         assert {s: sum(c.values()) for s, c in by_src.items()} == spec["n_images"]
         assert by_src["test"] == {"train": 0, "extra": 0, "test": 12}
@@ -458,13 +790,129 @@ def test_end_to_end_prepare_and_smoke_runs(tmp_path):
         assert spec["dropped_long_labels"]["by_source"] == {"train": 1, "extra": 0}
         assert (spec["vocabulary"].get("EOS") == EOS) == gru
         assert (spec["length_head"] is None) == (model == "crnn_ctc")
-        for key in want:
-            preds = json.loads((run / f"pred_{key}.json").read_text())
-            assert len(preds) == spec["n_images"]["val" if key == "val" else "test"]
-        assert (run / "attention_test.npz").exists() == (model == "cnn_attention_gru")
-        if model == "cnn_attention_gru":
-            att = np.load(run / "attention_test.npz")["attention"]
-            assert att.shape == (12, 6, 49)
         # a finished run is skipped unless --force
         out = subprocess.run(cmd, check=True, cwd=ROOT, env=env, capture_output=True, text=True)
         assert "already done" in out.stderr
+        # --eval-only reproduces the evaluation from ckpt.pt without touching it
+        ck = sha(run / "ckpt.pt")
+        subprocess.run([*cmd, "--eval-only"], check=True, cwd=ROOT, env=env, capture_output=True)
+        assert sha(run / "ckpt.pt") == ck
+        assert strip_seconds(check_run(run, model)) == strip_seconds(metrics)
+        assert not (run / "metrics_v1_greedy.json").exists()  # already non-greedy
+
+
+def test_eval_only_rewrites_a_greedy_run_and_keeps_the_checkpoint(tmp_path):
+    raw = write_raw(tmp_path / "raw", {"train": 40, "extra": 40, "test": 12})
+    cache = tmp_path / "cache"
+    prepare(raw, cache, size=64, workers=1)
+    env = os.environ | {"CUDA_VISIBLE_DEVICES": ""}
+    model = "cnn_attention_gru"
+    cmd = smoke_cmd(model, cache, tmp_path / "results")
+    subprocess.run(cmd, check=True, cwd=ROOT, env=env, capture_output=True, text=True)
+    run = tmp_path / "results" / "smoke" / "runs" / "task3" / model / "seed0"
+    new = json.loads((run / "metrics.json").read_text())
+    # turn it into a run written by the previous (greedy primary) code
+    old_keys = {  # v1 key -> the current key holding the same evaluation
+        "val": "val_greedy",
+        "test": "test_greedy",
+        "test_length_constrained": "test_length_constrained",
+        "test_beam3": "test",  # beam 3 or another width, only the format matters here
+        "test_whole": "test_whole_greedy",
+    }
+    v1 = {k: new[v] for k, v in old_keys.items()}
+    (run / "metrics.json").write_text(json.dumps(v1))
+    shutil.copy(run / "pred_test_greedy.json", run / "pred_test.json")
+    (run / "pred_test_greedy.json").unlink()
+    spec = json.loads((run / "spec.json").read_text())
+    for k in ("decoding", "decoding_modes", "selection", "setting", "cache_suffix"):
+        spec.pop(k)  # the previous code wrote none of these
+    spec["crop_protocol"].pop("stress_split")
+    (run / "spec.json").write_text(json.dumps(spec))
+    fp = json.loads((run / "fingerprint.json").read_text())
+    fp["config"].pop("cache_suffix", None)  # old fingerprints have no cache_suffix
+    (run / "fingerprint.json").write_text(json.dumps(fp))
+    keep = {f: sha(run / f) for f in ("ckpt.pt", "fingerprint.json", "history.json")}
+
+    out = subprocess.run(
+        [*cmd, "--eval-only"], check=True, cwd=ROOT, env=env, capture_output=True, text=True
+    )
+    assert "backed up the greedy metrics" in out.stderr
+    assert {f: sha(run / f) for f in keep} == keep
+    assert json.loads((run / "metrics_v1_greedy.json").read_text()) == v1
+    metrics = check_run(run, model)
+    assert strip_seconds(metrics) == strip_seconds(new)
+    assert metrics["test_greedy"] == v1["test"]  # the old primary is now the greedy diagnostic
+    spec = json.loads((run / "spec.json").read_text())
+    assert spec["eval_only"]["previous_metrics"] == "metrics_v1_greedy.json"
+    assert set(spec["eval_only"]["data"]) == {"val", "test"}
+    assert spec["epochs_run"] == 2  # training entries are kept
+    # the old run is labelled as the oracle crop setting, like newly trained runs
+    assert spec["setting"] == "oracle_crop" and spec["cache_suffix"] == ""
+    assert "training-time" in spec["selection"]
+    assert spec["crop_protocol"]["stress_split"] == "test_whole"
+    # a second --eval-only keeps the first backup
+    subprocess.run([*cmd, "--eval-only"], check=True, cwd=ROOT, env=env, capture_output=True)
+    assert json.loads((run / "metrics_v1_greedy.json").read_text()) == v1
+    assert {f: sha(run / f) for f in keep} == keep
+    # --eval-only refuses a config that changes the evaluation data
+    metrics_sha = sha(run / "metrics.json")
+    base = yaml.safe_load((ROOT / "configs" / "phase1_task3.yaml").read_text())
+    for i, change in enumerate(({"crop": 48}, {"cache_suffix": "_full"}, {"max_len": 4})):
+        path = tmp_path / f"changed{i}.yaml"
+        path.write_text(yaml.safe_dump(base | change))
+        bad = smoke_cmd(model, cache, tmp_path / "results", "--eval-only", config=path)
+        out = subprocess.run(bad, cwd=ROOT, env=env, capture_output=True, text=True)
+        assert out.returncode != 0 and "differ from training" in out.stderr
+    # ... and a cache whose training file changed size (rebuilt or another cache)
+    fp["data"]["size"] += 1
+    (run / "fingerprint.json").write_text(json.dumps(fp))
+    out = subprocess.run([*cmd, "--eval-only"], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode != 0 and "training saw" in out.stderr
+    assert sha(run / "metrics.json") == metrics_sha
+    # --eval-only refuses unfinished runs and --force
+    other = smoke_cmd("cnn_pool_gru", cache, tmp_path / "results", "--eval-only")
+    assert subprocess.run(other, cwd=ROOT, env=env, capture_output=True).returncode != 0
+    assert (
+        subprocess.run(
+            [*cmd, "--eval-only", "--force"], cwd=ROOT, env=env, capture_output=True
+        ).returncode
+        != 0
+    )
+    assert not (
+        tmp_path
+        / "results"
+        / "smoke"
+        / "runs"
+        / "task3"
+        / "cnn_pool_gru"
+        / "seed0"
+        / "metrics.json"
+    ).exists()
+
+
+def test_cache_suffix_and_no_stress_split(tmp_path):
+    """A whole-image style config: train/val/test read {split}_full_* and no stress split."""
+    raw = write_raw(tmp_path / "raw", {"train": 40, "extra": 40, "test": 12})
+    cache = tmp_path / "cache"
+    prepare(raw, cache, size=64, workers=1)
+    for split in ("train", "val", "test"):  # stand-in for prepare_whole: the same records
+        for kind in ("images.npy", "labels.json"):
+            shutil.copy(cache / f"{split}_{kind}", cache / f"{split}_full_{kind}")
+    (cache / "test_whole_images.npy").unlink()  # must not be read
+    cfg = yaml.safe_load((ROOT / "configs" / "phase1_task3.yaml").read_text())
+    cfg |= {"cache_suffix": "_full", "stress_split": None}
+    cfg["models"] = {"crnn_ctc_whole": cfg["models"]["crnn_ctc"]}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    env = os.environ | {"CUDA_VISIBLE_DEVICES": ""}
+    cmd = smoke_cmd("crnn_ctc_whole", cache, tmp_path / "results", config=path)
+    subprocess.run(cmd, check=True, cwd=ROOT, env=env, capture_output=True, text=True)
+    run = tmp_path / "results" / "smoke" / "runs" / "task3" / "crnn_ctc_whole" / "seed0"
+    check_run(run, "crnn_ctc_whole", stress=None)
+    spec = json.loads((run / "spec.json").read_text())
+    assert spec["setting"] == "whole_image" and spec["cache_suffix"] == "_full"
+    assert set(spec["n_images"]) == {"train", "val", "test"}
+    fp = json.loads((run / "fingerprint.json").read_text())
+    assert fp["data"]["path"].endswith("train_full_images.npy")
+    subprocess.run([*cmd, "--eval-only"], check=True, cwd=ROOT, env=env, capture_output=True)
+    check_run(run, "crnn_ctc_whole", stress=None)

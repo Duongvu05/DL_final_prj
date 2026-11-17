@@ -27,7 +27,8 @@ therefore get the same precision.
 
 ONNX: `GreedyDecodeExport` wraps a recognizer so that `torch.onnx.export` traces the CNN,
 the token mixer and the whole greedy decode (max_len + 1 unrolled steps, EOS forced at the
-last step) into one graph that maps images to token ids.
+last step) into one graph that maps images to token ids. It is a deployment check only. The
+reported Task 3 results use the inherited beam search (scripts/run_ocr.py).
 """
 
 from typing import Literal, cast
@@ -331,7 +332,9 @@ class MixedTokenEncoder(nn.Module):
 class MixerAttentionGRURecognizer(GRUDecoderRecognizer):
     """Phase 1 attentive GRU decoder over d_model-wide mixed visual tokens.
 
-    All decoding, loss and prediction code is inherited from GRUDecoderRecognizer. Only
+    All decoding (greedy, length-constrained and the batched beam search of any width that
+    gives the reported results), loss and prediction code is inherited from
+    GRUDecoderRecognizer. Only
     __init__ differs, because the encoder and the token width (d_model instead of 512) change.
     It builds the same decoder modules as the parent, in the same order.
     """

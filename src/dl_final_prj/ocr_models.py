@@ -13,9 +13,20 @@ after stages 1-3 and Dropout2d(0.1) after each stage. A 54x54 crop gives a 512x7
 Every model has `loss(batch)` (fp32 training loss) and `predict(images, mode)` returning digit
 strings and an aux dict. The CNN runs under the caller's autocast (bf16 on CUDA), while the
 recurrent parts and the losses run in fp32.
+
+Decoding. The reported (primary) decoding is never greedy:
+- GRU decoders (Phase 1 and the Phase 2 token-mixer models): batched beam search "beam{W}",
+  score = summed log-probability / number of tokens (digits + EOS), EOS forced at the
+  max_len step.
+- CRNN-CTC: CTC prefix beam search "prefix{W}" (blank 0), at most max_len digits.
+- Multi-head CNN: exact MAP decoding "map" over (length, digits).
+The width W of the first two is chosen on the validation split from BEAM_WIDTHS by exact
+match, ties to the smaller width (select_width). "greedy" (and "length" for the GRU
+decoders) remain as labelled diagnostics.
 """
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -25,6 +36,7 @@ from dl_final_prj.svhn import DIGIT0, EOS, MAX_LEN, PAD, SOS, VOCAB, OcrBatch, d
 from dl_final_prj.ts_models import AdditiveAttention
 
 N_LENGTHS = MAX_LEN  # length classes 1..5
+BEAM_WIDTHS = (3, 5, 10)  # candidate widths, one is selected on validation
 
 
 def _fp32(x: torch.Tensor):
@@ -91,7 +103,7 @@ class GRUDecoderRecognizer(nn.Module):
     the number of digits (1..5) from the mean token.
     """
 
-    modes = ("greedy", "length", "beam3")
+    modes = ("greedy", "length", *(f"beam{w}" for w in BEAM_WIDTHS))
     attention = True
 
     def __init__(
@@ -208,11 +220,14 @@ class GRUDecoderRecognizer(nn.Module):
             att = torch.stack(weights, 1) if self.attn is not None else None
             return torch.stack(ids, 1), att
 
-    def beam(self, images: torch.Tensor, width: int = 3) -> torch.Tensor:
-        """Batched beam search without length constraint. The final hypothesis maximizes the
-        summed log-probability divided by its number of tokens (digits plus EOS). EOS is
-        forced at the last step, so no hypothesis has more than max_len digits.
-        Returns token ids (B, T)."""
+    def beam(self, images: torch.Tensor, width: int = 3):
+        """Batched beam search of any width without length constraint. Beams are pruned by the
+        summed log-probability. The final hypothesis maximizes the summed log-probability
+        divided by its number of tokens (digits plus EOS). EOS is forced at the last step, so
+        no hypothesis has more than max_len digits. width=1 is greedy decoding.
+        Returns token ids (B, T) and the attention (B, T, L) of the chosen beam, or None."""
+        if width < 1:
+            raise ValueError(f"beam width must be >= 1, got {width}")
         feats, mean, kp = self.encode(images)
         with _fp32(feats):
             bsz, k_, dev = feats.shape[0], width, feats.device
@@ -225,6 +240,7 @@ class GRUDecoderRecognizer(nn.Module):
             finished = torch.zeros(bsz, k_, dtype=torch.bool, device=dev)
             ntok = torch.zeros(bsz, k_, device=dev)
             hist = torch.zeros(bsz, k_, 0, dtype=torch.long, device=dev)
+            att: torch.Tensor | None = None
             prev = torch.full((bsz * k_,), SOS, dtype=torch.long, device=dev)
             pad_only = torch.full((VOCAB,), float("-inf"), device=dev)
             pad_only[PAD] = 0.0  # a finished beam continues with PAD at no cost
@@ -232,7 +248,7 @@ class GRUDecoderRecognizer(nn.Module):
             eos_only = torch.full((VOCAB,), float("-inf"), device=dev)
             eos_only[EOS] = 0.0
             for k in range(self.max_len + 1):
-                logits, h, _ = self.step(prev, h, feats, kp, mean_k)
+                logits, h, w = self.step(prev, h, feats, kp, mean_k)
                 logp = self._mask_special(logits).log_softmax(-1).view(bsz, k_, VOCAB)
                 if k == self.max_len:  # safety stop, the EOS probability still counts
                     logp = logp + eos_only
@@ -246,24 +262,38 @@ class GRUDecoderRecognizer(nn.Module):
                     [hist.gather(1, src[..., None].expand(-1, -1, hist.shape[2])), tok[..., None]],
                     -1,
                 )
+                if w is not None:  # the weights of step k belong to the source beam
+                    w_src = (
+                        w.float()
+                        .view(bsz, k_, 1, -1)
+                        .gather(1, src[..., None, None].expand(-1, -1, 1, w.shape[-1]))
+                    )
+                    if att is not None:
+                        idx = src[..., None, None].expand(-1, -1, *att.shape[2:])
+                        w_src = torch.cat([att.gather(1, idx), w_src], 2)
+                    att = w_src
                 h = h[(src + base).view(-1)]
                 scores, prev = top, tok.view(-1)
             best = (scores / ntok.clamp(min=1)).argmax(-1)
-            return hist[torch.arange(bsz, device=dev), best]
+            rows = torch.arange(bsz, device=dev)
+            return hist[rows, best], (att[rows, best] if att is not None else None)
 
     def predict(self, images: torch.Tensor, mode: str = "greedy"):
-        """Digit strings for mode greedy (primary), length (length-constrained) or beamN."""
+        """Digit strings for mode beamW (primary, any width W >= 1), greedy (diagnostic) or
+        length (greedy constrained to the length head, diagnostic). aux["attention"]
+        (B, T, L) holds the attention of the returned sequence (attention models only)."""
         aux: dict[str, torch.Tensor] = {}
+        att = None
         if mode == "greedy":
             ids, att = self.greedy(images)
-            if att is not None:
-                aux["attention"] = att
         elif mode == "length":
             ids, _ = self.greedy(images, constrain=True)
-        elif mode.startswith("beam"):
-            ids = self.beam(images, int(mode[4:]))
+        elif mode.startswith("beam") and mode[4:].isdigit():
+            ids, att = self.beam(images, int(mode[4:]))
         else:
             raise ValueError(f"unknown decoding mode {mode}")
+        if att is not None:
+            aux["attention"] = att
         return [decode(s) for s in ids.cpu().tolist()], aux
 
 
@@ -281,9 +311,11 @@ class PooledGRURecognizer(GRUDecoderRecognizer):
 
 class MultiHeadCNN(nn.Module):
     """Goodfellow et al. (2014) style. Flattened CNN map -> 2 FC layers -> length head (5)
-    and five digit heads (10). Loss = CE(length) + sum of CE over the true digit positions."""
+    and five digit heads (10). Loss = CE(length) + sum of CE over the true digit positions.
+    Decoding: "map" (primary, multihead_map) or "greedy" (argmax length, then the argmax
+    digit of the first L heads, diagnostic)."""
 
-    modes = ("greedy",)
+    modes = ("greedy", "map")
 
     def __init__(
         self,
@@ -323,22 +355,46 @@ class MultiHeadCNN(nn.Module):
         return per_image.mean()
 
     def predict(self, images: torch.Tensor, mode: str = "greedy"):
-        if mode != "greedy":
-            raise ValueError(f"unknown decoding mode {mode}")
         length_logits, digit_logits = self(images)
-        lengths = (length_logits.argmax(-1) + 1).cpu().tolist()
-        digits = digit_logits.argmax(-1).cpu().tolist()
-        return ["".join(str(d) for d in ds[:n]) for ds, n in zip(digits, lengths)], {}
+        if mode == "greedy":
+            lengths, digits = length_logits.argmax(-1) + 1, digit_logits.argmax(-1)
+        elif mode == "map":
+            lengths, digits = multihead_map(length_logits, digit_logits)
+        else:
+            raise ValueError(f"unknown decoding mode {mode}")
+        return [
+            "".join(str(d) for d in ds[:n])
+            for ds, n in zip(digits.cpu().tolist(), lengths.cpu().tolist())
+        ], {}
+
+
+def multihead_map(
+    length_logits: torch.Tensor, digit_logits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact MAP over (L, digits) of the multi-head model, which factorizes as
+    p(L) * prod_{i<L} p(d_i | head i). For each L the best digits are the per-head argmax, so
+    L* = argmax_L [log p(L) + sum_{i<L} max_d log p(d | head i)] (ties to the shorter L).
+    length_logits (B, max_len), digit_logits (B, max_len, 10) -> lengths (B,) in 1..max_len
+    and digits (B, max_len) (only the first L are read)."""
+    len_lp = length_logits.float().log_softmax(-1)
+    best_lp, digits = digit_logits.float().log_softmax(-1).max(-1)
+    score = len_lp + best_lp.cumsum(-1)  # score[:, L - 1] for length L
+    return score.argmax(-1) + 1, digits
 
 
 class CTCRecognizer(nn.Module):
     """CRNN. Pooling (2,2), (2,2), (2,1) gives 512x7x14, averaged over height -> 14 steps ->
-    2-layer BiLSTM -> 11 classes. Class 0 is the CTC blank, class 1 + d is digit d."""
+    2-layer BiLSTM -> 11 classes. Class 0 is the CTC blank, class 1 + d is digit d.
+    Decoding: "prefixW" (primary, CTC prefix beam search of width W, at most max_len digits)
+    or "greedy" (best path, diagnostic, may exceed max_len)."""
 
-    modes = ("greedy",)
+    modes = ("greedy", *(f"prefix{w}" for w in BEAM_WIDTHS))
 
-    def __init__(self, hidden: int = 256, layers: int = 2, cnn_dropout: float = 0.1) -> None:
+    def __init__(
+        self, hidden: int = 256, layers: int = 2, cnn_dropout: float = 0.1, max_len: int = MAX_LEN
+    ) -> None:
         super().__init__()
+        self.max_len = max_len
         self.cnn = VggEncoder(pools=((2, 2), (2, 2), (2, 1)), dropout=cnn_dropout)
         self.rnn = nn.LSTM(
             self.cnn.out_channels, hidden, layers, batch_first=True, bidirectional=True
@@ -356,9 +412,11 @@ class CTCRecognizer(nn.Module):
         return ctc_loss(self(b.images), b.tokens)
 
     def predict(self, images: torch.Tensor, mode: str = "greedy"):
-        if mode != "greedy":
-            raise ValueError(f"unknown decoding mode {mode}")
-        return ctc_greedy(self(images)), {}
+        if mode == "greedy":
+            return ctc_greedy(self(images)), {}
+        if mode.startswith("prefix") and mode[6:].isdigit():
+            return ctc_prefix_beam(self(images), int(mode[6:]), self.max_len), {}
+        raise ValueError(f"unknown decoding mode {mode}")
 
 
 def tokens_to_ctc_targets(tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -389,6 +447,121 @@ def ctc_greedy(logits: torch.Tensor) -> list[str]:
     return out
 
 
+def _logaddexp(a: float, b: float) -> float:
+    if a == -math.inf:
+        return b
+    if b == -math.inf:
+        return a
+    m = max(a, b)
+    return m + math.log(math.exp(a - m) + math.exp(b - m))
+
+
+def ctc_prefix_beam_one(
+    logp: Sequence[Sequence[float]], width: int, max_len: int | None = None
+) -> list[tuple[tuple[int, ...], float]]:
+    """CTC prefix beam search on one sequence of per-step log-probabilities (T, C), blank 0.
+
+    Every prefix keeps two log-probabilities, of the paths that end in a blank (pb) and of
+    those that end in its last label (pnb). Per step a prefix is extended by blank (stays),
+    by its last label c (stays, only from pnb: a repeat merges) and by any label (grows).
+    The same label after a blank grows the prefix ("1", blank, "1" reads "11"). The `width`
+    most probable prefixes survive each step (ties by prefix, for determinism).
+    With `max_len`, a prefix of max_len labels never grows, so no longer prefix takes a beam
+    slot. This is exact: the probability of a prefix never depends on longer prefixes.
+    Returns the final prefixes as (labels tuple, log-probability), best first."""
+    if width < 1:
+        raise ValueError(f"beam width must be >= 1, got {width}")
+    ninf = -math.inf
+    beams: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, ninf)}
+    for row in logp:
+        nxt: dict[tuple[int, ...], list[float]] = {}
+        for prefix, (pb, pnb) in beams.items():
+            total = _logaddexp(pb, pnb)
+            stay = nxt.setdefault(prefix, [ninf, ninf])
+            stay[0] = _logaddexp(stay[0], total + row[0])
+            last = prefix[-1] if prefix else None
+            full = max_len is not None and len(prefix) >= max_len
+            for c in range(1, len(row)):
+                p = row[c]
+                if p == ninf:
+                    continue
+                if c == last:
+                    stay[1] = _logaddexp(stay[1], pnb + p)  # repeat without blank merges
+                    src = pb  # a repeat grows the prefix only after a blank
+                else:
+                    src = total
+                if src != ninf and not full:
+                    grown = nxt.setdefault((*prefix, c), [ninf, ninf])
+                    grown[1] = _logaddexp(grown[1], src + p)
+        ranked = sorted(nxt.items(), key=lambda kv: (-_logaddexp(*kv[1]), kv[0]))
+        beams = {k: (v[0], v[1]) for k, v in ranked[:width]}
+    return sorted(((k, _logaddexp(*v)) for k, v in beams.items()), key=lambda kv: (-kv[1], kv[0]))
+
+
+def ctc_prefix_beam(logits: torch.Tensor, width: int, max_len: int = MAX_LEN) -> list[str]:
+    """Prefix beam search for a batch of CTC logits (B, T, 11), class 1 + d is digit d.
+    Prefixes never grow past max_len digits during the search, so the result is always a
+    scored prefix: the most probable surviving prefix with at most max_len digits."""
+    logp = logits.float().log_softmax(-1).cpu().tolist()
+    out = []
+    for seq in logp:
+        best = ctc_prefix_beam_one(seq, width, max_len)[0][0]
+        out.append("".join(str(c - 1) for c in best))
+    return out
+
+
+# --- decoding policy ----------------------------------------------------------------------
+
+PRIMARY_DECODING = {"gru": "beam", "ctc": "ctc_prefix_beam", "multihead": "map"}
+DECODING_TEXT = {
+    "beam": "beam search of width W (selected on validation), unconstrained, score = summed "
+    "log-probability / number of tokens (digits + EOS), EOS forced at the max_len step",
+    "ctc_prefix_beam": "CTC prefix beam search of width W (selected on validation), blank 0, "
+    "repeats merge unless separated by a blank, best prefix with at most max_len digits",
+    "map": "exact MAP over (L, digits): L = argmax log p(L) + sum_{i<L} max_d log p(d | head i), "
+    "then the argmax digits of the first L heads",
+    "greedy_gru": "greedy (argmax per step), unconstrained, EOS forced at the max_len step "
+    "(diagnostic only)",
+    "greedy_ctc": "CTC best path (argmax per step, merge repeats, drop blanks), diagnostic only",
+    "greedy_multihead": "argmax length head, then the argmax digits of the first L heads "
+    "(diagnostic only)",
+    "length": "greedy constrained to the length-head prediction (diagnostic only)",
+}
+
+
+def decoder_family(model: nn.Module) -> str:
+    """gru (every GRUDecoderRecognizer, Phase 1 and 2), ctc or multihead."""
+    if isinstance(model, GRUDecoderRecognizer):
+        return "gru"
+    if isinstance(model, CTCRecognizer):
+        return "ctc"
+    if isinstance(model, MultiHeadCNN):
+        return "multihead"
+    raise TypeError(f"no decoding policy for {type(model).__name__}")
+
+
+def search_widths(model: nn.Module) -> tuple[int, ...]:
+    """Candidate widths of the primary decoding, () when it has no width (multi-head MAP)."""
+    return () if decoder_family(model) == "multihead" else BEAM_WIDTHS
+
+
+def primary_mode(model: nn.Module, width: int | None) -> str:
+    """predict() mode string of the primary (non-greedy) decoding at `width`."""
+    fam = decoder_family(model)
+    if fam == "multihead":
+        return "map"
+    if width is None:
+        raise ValueError(f"{fam} decoding needs a width")
+    return f"beam{width}" if fam == "gru" else f"prefix{width}"
+
+
+def select_width(val_exact_by_width: Mapping[int, float]) -> int:
+    """The width with the best validation exact match, ties to the smaller width."""
+    if not val_exact_by_width:
+        raise ValueError("no width to select from")
+    return min(val_exact_by_width, key=lambda w: (-val_exact_by_width[w], w))
+
+
 def build(kind: str, args: dict | None = None, max_len: int = MAX_LEN, **extra) -> nn.Module:
     """Model from its config kind: attention, pooled, multihead or ctc (Phase 1), or
     mamba_attention or gru_mixer_attention (Phase 2, see ocr_mamba)."""
@@ -403,5 +576,5 @@ def build(kind: str, args: dict | None = None, max_len: int = MAX_LEN, **extra) 
     if kind == "multihead":
         return MultiHeadCNN(max_len=max_len, **args)
     if kind == "ctc":
-        return CTCRecognizer(**args)
+        return CTCRecognizer(**args, max_len=max_len)
     raise ValueError(f"unknown model kind {kind}")
