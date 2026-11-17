@@ -23,16 +23,38 @@ Decoding. The reported (primary) decoding is never greedy:
 The width W of the first two is chosen on the validation split from BEAM_WIDTHS by exact
 match, ties to the smaller width (select_width). "greedy" (and "length" for the GRU
 decoders) remain as labelled diagnostics.
+
+Secondary GRU decodings (opt-in, scripts/rescore_task3.py, never the primary result). They
+rerank the n-best list of the primary beam (GRUDecoderRecognizer.nbest, the validation-selected
+width): "mbr_edit" (edit-distance minimum Bayes risk), "length_rescore" (length head) and
+"bidir_rescore" (DRAM-style forward-backward with a right-to-left model, score_strings). Their
+lambdas are selected on validation only (select_lambda). A right-to-left model is the same
+architecture built with reverse_target=True and trained on reversed targets
+(SvhnSplit(reverse=True)). Its predictions are reversed back, so they read left-to-right.
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
-from dl_final_prj.svhn import DIGIT0, EOS, MAX_LEN, PAD, SOS, VOCAB, OcrBatch, decode
+from dl_final_prj.fast import levenshtein_batch
+from dl_final_prj.svhn import (
+    DIGIT0,
+    EOS,
+    MAX_LEN,
+    PAD,
+    SOS,
+    VOCAB,
+    OcrBatch,
+    decode,
+    encode,
+    target_order,
+)
 from dl_final_prj.ts_models import AdditiveAttention
 
 N_LENGTHS = MAX_LEN  # length classes 1..5
@@ -105,6 +127,9 @@ class GRUDecoderRecognizer(nn.Module):
 
     modes = ("greedy", "length", *(f"beam{w}" for w in BEAM_WIDTHS))
     attention = True
+    # Right-to-left decoder (opt-in, build(reverse_target=True)): trained on the reversed digit
+    # string. Every decoded string is reversed back, so predictions always read left-to-right.
+    reverse_target = False
 
     def __init__(
         self,
@@ -226,6 +251,15 @@ class GRUDecoderRecognizer(nn.Module):
         divided by its number of tokens (digits plus EOS). EOS is forced at the last step, so
         no hypothesis has more than max_len digits. width=1 is greedy decoding.
         Returns token ids (B, T) and the attention (B, T, L) of the chosen beam, or None."""
+        hist, scores, ntok, att, _ = self._beam_search(images, width)
+        best = (scores / ntok.clamp(min=1)).argmax(-1)
+        rows = torch.arange(hist.shape[0], device=hist.device)
+        return hist[rows, best], (att[rows, best] if att is not None else None)
+
+    def _beam_search(self, images: torch.Tensor, width: int):
+        """The search behind beam() and nbest(). Returns the final beams: token ids
+        (B, W, T), summed log-probabilities (B, W) (-inf for an unused beam), token counts
+        (B, W) (digits + EOS), attention (B, W, T, L) or None, and the mean token (B, C)."""
         if width < 1:
             raise ValueError(f"beam width must be >= 1, got {width}")
         feats, mean, kp = self.encode(images)
@@ -274,9 +308,70 @@ class GRUDecoderRecognizer(nn.Module):
                     att = w_src
                 h = h[(src + base).view(-1)]
                 scores, prev = top, tok.view(-1)
-            best = (scores / ntok.clamp(min=1)).argmax(-1)
-            rows = torch.arange(bsz, device=dev)
-            return hist[rows, best], (att[rows, best] if att is not None else None)
+            return hist, scores, ntok, att, mean
+
+    def nbest(self, images: torch.Tensor, width: int):
+        """The `width` finished hypotheses of beam(images, width) per image, best first by the
+        primary score (summed log-probability / tokens, stable order, so the first one is
+        exactly beam()'s choice). Unused beams (-inf) are dropped. Predictions read
+        left-to-right (a reverse_target model's strings are reversed back).
+        Returns (hyps, length log-probabilities (B, N_LENGTHS) of the length head), where
+        hyps[b] is a list of (pred, logp, logp_norm, n_tokens)."""
+        hist, scores, ntok, _, mean = self._beam_search(images, width)
+        with _fp32(mean):
+            len_lp = self.length_head(mean.float()).float().log_softmax(-1)
+        norm = scores / ntok.clamp(min=1)
+        order = torch.sort(norm, dim=-1, descending=True, stable=True).indices
+        ids, raw, nrm, cnt = (t.cpu().tolist() for t in (hist, scores, norm, ntok))
+        out = []
+        for b, row in enumerate(order.cpu().tolist()):
+            out.append(
+                [
+                    (self._reported(decode(ids[b][j])), raw[b][j], nrm[b][j], int(cnt[b][j]))
+                    for j in row
+                    if math.isfinite(raw[b][j])
+                ]
+            )
+        return out, len_lp
+
+    def score_strings(self, images: torch.Tensor, strings: Sequence[Sequence[str]]):
+        """Teacher-forced summed log-probability of given left-to-right digit strings,
+        strings[b] for image b, with the softmax of decoding (PAD and SOS masked) over the
+        digits and EOS. A reverse_target model scores the reversed string, so for a
+        right-to-left model this is log P_R2L(reverse(s)). Returns a list per image."""
+        feats, mean, kp = self.encode(images)
+        flat = [s for ss in strings for s in ss]
+        if not flat:
+            return [[] for _ in strings]
+        with _fp32(feats):
+            dev = feats.device
+            owner = torch.tensor([i for i, ss in enumerate(strings) for _ in ss], device=dev)
+            tokens = torch.tensor(
+                [encode(target_order(s, self.reverse_target), self.max_len) for s in flat],
+                dtype=torch.long,
+                device=dev,
+            )
+            f, m = feats[owner], mean[owner]
+            k_rep = kp[owner] if kp is not None else None
+            h = self.init_state(m)
+            prev = torch.full((len(flat),), SOS, dtype=torch.long, device=dev)
+            total = torch.zeros(len(flat), device=dev)
+            for k in range(tokens.shape[1]):
+                logits, h, _ = self.step(prev, h, f, k_rep, m)
+                lp = self._mask_special(logits).log_softmax(-1)
+                tok = tokens[:, k]
+                total = total + torch.where(tok != PAD, lp.gather(1, tok[:, None])[:, 0], 0.0)
+                prev = tok
+        vals = total.cpu().tolist()
+        out, i = [], 0
+        for ss in strings:
+            out.append(vals[i : i + len(ss)])
+            i += len(ss)
+        return out
+
+    def _reported(self, s: str) -> str:
+        """Left-to-right reading of a decoded string."""
+        return target_order(s, self.reverse_target)
 
     def predict(self, images: torch.Tensor, mode: str = "greedy"):
         """Digit strings for mode beamW (primary, any width W >= 1), greedy (diagnostic) or
@@ -294,7 +389,7 @@ class GRUDecoderRecognizer(nn.Module):
             raise ValueError(f"unknown decoding mode {mode}")
         if att is not None:
             aux["attention"] = att
-        return [decode(s) for s in ids.cpu().tolist()], aux
+        return [self._reported(decode(s)) for s in ids.cpu().tolist()], aux
 
 
 class AttentionGRURecognizer(GRUDecoderRecognizer):
@@ -562,9 +657,25 @@ def select_width(val_exact_by_width: Mapping[int, float]) -> int:
     return min(val_exact_by_width, key=lambda w: (-val_exact_by_width[w], w))
 
 
-def build(kind: str, args: dict | None = None, max_len: int = MAX_LEN, **extra) -> nn.Module:
+def build(
+    kind: str,
+    args: dict | None = None,
+    max_len: int = MAX_LEN,
+    reverse_target: bool = False,
+    **extra,
+) -> nn.Module:
     """Model from its config kind: attention, pooled, multihead or ctc (Phase 1), or
-    mamba_attention or gru_mixer_attention (Phase 2, see ocr_mamba)."""
+    mamba_attention or gru_mixer_attention (Phase 2, see ocr_mamba). reverse_target=True
+    (GRU decoders only) makes a right-to-left decoder. It adds no parameter."""
+    model = _build(kind, args, max_len, **extra)
+    if reverse_target:
+        if not isinstance(model, GRUDecoderRecognizer):
+            raise ValueError(f"reverse_target applies to the GRU decoders only, not {kind}")
+        model.reverse_target = True
+    return model
+
+
+def _build(kind: str, args: dict | None, max_len: int, **extra) -> nn.Module:
     args = dict(args or {})
     if kind in ("mamba_attention", "gru_mixer_attention"):
         from dl_final_prj.ocr_mamba import build_mixer_recognizer  # lazy: ocr_mamba imports us
@@ -578,3 +689,176 @@ def build(kind: str, args: dict | None = None, max_len: int = MAX_LEN, **extra) 
     if kind == "ctc":
         return CTCRecognizer(**args, max_len=max_len)
     raise ValueError(f"unknown model kind {kind}")
+
+
+# --- secondary GRU decodings: n-best rescoring (plan 2.3) ---------------------------------
+#
+# All of them rerank the frozen n-best list of the primary beam (validation-selected width)
+# and never change the primary result. Lambdas come from LAMBDA_GRID and are selected on the
+# validation split only (select_lambda, ties to the smaller lambda), then applied unchanged to
+# test.
+
+LAMBDA_GRID = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)  # plan 2.3 pre-registered grid
+SECONDARY_METHODS = ("mbr_edit", "length_rescore", "bidir_rescore")
+SECONDARY_PLAN_NAMES = {
+    "mbr_edit": "mbr_edit_secondary",
+    "length_rescore": "length_rescore_secondary",
+    "bidir_rescore": "dram_fb_secondary",
+}
+SECONDARY_TEXT = {
+    "mbr_edit": "minimum Bayes risk over the primary-beam n-best list (Kumar and Byrne 2004): "
+    "posterior = softmax of the summed sequence log-probability over the list, loss = "
+    "Levenshtein distance, the hypothesis with the least expected edit distance wins (ties to "
+    "the better primary rank). No tuned parameter",
+    "length_rescore": "n-best rescoring with the auxiliary length head: score = primary score "
+    "(summed log-probability / tokens) + lambda * log P_length(number of digits), lambda "
+    "selected on validation exact match. lambda 0 is the primary beam",
+    "bidir_rescore": "DRAM-style forward-backward rescoring (Ba et al. 2015): score = (log "
+    "P_L2R(hyp) + lambda * log P_R2L(reverse(hyp))) / tokens, with log P_R2L the "
+    "teacher-forced log-probability (digits + EOS) under the same-seed right-to-left model. "
+    "lambda selected on validation exact match. lambda 0 is the primary beam",
+}
+
+
+@dataclass
+class NBest:
+    """n-best lists of one split, padded to `width` columns (a padded entry has pred "" and
+    logp -inf). Column 0 is the primary beam's choice. split names the data split and is
+    checked by select_lambda, which accepts validation lists only."""
+
+    split: str
+    width: int
+    preds: list[list[str]]  # (N, K) left-to-right digit strings, best primary score first
+    logp: np.ndarray  # (N, K) summed log-probability of digits + EOS, -inf pad
+    logp_norm: np.ndarray  # (N, K) primary score logp / n_tokens, -inf pad
+    n_tokens: np.ndarray  # (N, K) digits + EOS, 0 pad
+    len_logp: np.ndarray  # (N, N_LENGTHS) length-head log-probabilities, lengths 1..5
+
+    @classmethod
+    def from_hyps(
+        cls, split: str, width: int, hyps: Sequence[Sequence[tuple]], len_logp: np.ndarray
+    ) -> "NBest":
+        n = len(hyps)
+        if any(not h for h in hyps):
+            raise ValueError("every image needs at least one hypothesis")
+        k = max(width, max(len(h) for h in hyps))
+        preds = [[""] * k for _ in range(n)]
+        logp = np.full((n, k), -np.inf)
+        norm = np.full((n, k), -np.inf)
+        ntok = np.zeros((n, k), np.int64)
+        for i, row in enumerate(hyps):
+            for j, (p, lp, ln, nt) in enumerate(row):
+                preds[i][j], logp[i, j], norm[i, j], ntok[i, j] = p, lp, ln, nt
+        return cls(split, width, preds, logp, norm, ntok, np.asarray(len_logp, np.float64))
+
+    def __len__(self) -> int:
+        return len(self.preds)
+
+    @property
+    def valid(self) -> np.ndarray:
+        return np.isfinite(self.logp)
+
+    def hyps(self) -> list[list[str]]:
+        """The real (unpadded) hypotheses per image."""
+        return [
+            [p for p, ok in zip(row, v, strict=True) if ok]
+            for row, v in zip(self.preds, self.valid, strict=True)
+        ]
+
+    def top1(self) -> list[str]:
+        return [row[0] for row in self.preds]
+
+    def pick(self, scores: np.ndarray) -> list[str]:
+        """The argmax of `scores` (N, K) per image over the real hypotheses. Ties and rows
+        with no finite score go to the earlier (better primary) rank."""
+        s = np.where(self.valid, np.asarray(scores, np.float64), -np.inf)
+        s = np.where(np.isnan(s), -np.inf, s)
+        best = s.argmax(1)
+        return [self.preds[i][j] for i, j in enumerate(best.tolist())]
+
+    def r2l_matrix(self, r2l: Sequence[Sequence[float]]) -> np.ndarray:
+        """Per-image lists of R2L scores (same order as hyps()) -> padded (N, K)."""
+        out = np.full(self.logp.shape, -np.inf)
+        for i, (row, v) in enumerate(zip(r2l, self.valid, strict=True)):
+            if len(row) != int(v.sum()):
+                raise ValueError(f"image {i}: {len(row)} R2L scores for {int(v.sum())} hyps")
+            out[i, : len(row)] = row
+        return out
+
+
+def length_logp_of(nb: NBest) -> np.ndarray:
+    """log P_length(number of digits) of every hypothesis (N, K). -inf for 0 digits or more
+    than the head's classes (never chosen once lambda > 0) and for padding."""
+    n_len = nb.len_logp.shape[1]
+    lengths = np.array([[len(p) for p in row] for row in nb.preds], np.int64)
+    ok = (lengths >= 1) & (lengths <= n_len) & nb.valid
+    idx = np.clip(lengths - 1, 0, n_len - 1)
+    lp = np.take_along_axis(nb.len_logp, idx, 1)
+    return np.where(ok, lp, -np.inf)
+
+
+def length_rescore(nb: NBest, lam: float) -> list[str]:
+    """argmax primary score + lam * log P_length. lam = 0 is exactly the primary beam."""
+    if lam == 0:
+        return nb.pick(nb.logp_norm)
+    return nb.pick(nb.logp_norm + lam * length_logp_of(nb))
+
+
+def bidir_rescore(nb: NBest, r2l_logp: np.ndarray, lam: float) -> list[str]:
+    """argmax (log P_L2R + lam * log P_R2L(reverse)) / n_tokens, written as the primary score
+    plus lam * log P_R2L / n_tokens so that lam = 0 is exactly the primary beam.
+    r2l_logp is (N, K) aligned with nb (NBest.r2l_matrix)."""
+    if lam == 0:
+        return nb.pick(nb.logp_norm)
+    return nb.pick(nb.logp_norm + lam * r2l_logp / np.maximum(nb.n_tokens, 1))
+
+
+def mbr_edit(nb: NBest) -> list[str]:
+    """Edit-distance MBR over each n-best list. Posterior p_j = softmax(logp_j) over the
+    list, risk_i = sum_j p_j * lev(h_i, h_j), the least risk wins (ties to the earlier rank).
+    With one hypothesis carrying all the mass this is the MAP hypothesis."""
+    a, b = [], []
+    k = nb.logp.shape[1]
+    for row in nb.preds:
+        for x in row:
+            a += [x] * k
+            b += row
+    dist = levenshtein_batch(a, b).astype(np.float64).reshape(len(nb), k, k)
+    valid = nb.valid
+    lp = np.where(valid, nb.logp, -np.inf)
+    lp = lp - lp.max(1, keepdims=True)
+    post = np.exp(lp)
+    post /= post.sum(1, keepdims=True)
+    risk = np.einsum("nij,nj->ni", dist, post)
+    risk = np.where(valid, risk, np.inf)
+    best = risk.argmin(1)
+    return [nb.preds[i][j] for i, j in enumerate(best.tolist())]
+
+
+def select_lambda(val_exact_by_lambda: Mapping[float, float], split: str = "val") -> float:
+    """The lambda with the best validation exact match, ties to the smaller lambda.
+    `split` names where the exact matches come from. Anything but "val" is refused."""
+    if split != "val":
+        raise ValueError(f"lambda selection uses the validation split only, got {split!r}")
+    if not val_exact_by_lambda:
+        raise ValueError("no lambda to select from")
+    return min(val_exact_by_lambda, key=lambda x: (-val_exact_by_lambda[x], x))
+
+
+def exact_by_lambda(
+    nb: NBest,
+    labels: Sequence[str],
+    rescore: Callable[[float], list[str]],
+    grid: Sequence[float] = LAMBDA_GRID,
+) -> dict[float, float]:
+    """Exact match of rescore(lambda) on nb for every lambda of the grid. nb must be the
+    validation n-best list (this feeds select_lambda)."""
+    if nb.split != "val":
+        raise ValueError(f"lambda search runs on the validation split only, got {nb.split!r}")
+    if len(labels) != len(nb):
+        raise ValueError("labels and n-best lists differ in length")
+    out = {}
+    for lam in grid:
+        preds = rescore(float(lam))
+        out[float(lam)] = float(np.mean([p == t for p, t in zip(preds, labels, strict=True)]))
+    return out

@@ -585,6 +585,13 @@ def encode(label: str, max_len: int = MAX_LEN) -> list[int]:
     return ids + [PAD] * (max_len + 1 - len(ids))
 
 
+def target_order(label: str, reverse: bool = False) -> str:
+    """The digit string a decoder is trained to emit: the label, or the reversed label for a
+    right-to-left decoder (reverse_target). It is its own inverse, so it also maps a decoded
+    right-to-left string back to the left-to-right reading."""
+    return label[::-1] if reverse else label
+
+
 def decode(ids: Sequence[int]) -> str:
     out = []
     for i in ids:
@@ -636,6 +643,9 @@ class SvhnSplit:
     Training batches take a random crop per image and apply ColorJitter on the device,
     evaluation batches take the center crop. All random numbers come from the CPU
     generator passed in, so a resumed epoch sees exactly the same augmentation.
+
+    reverse=True (opt-in, right-to-left decoders) encodes the decoder targets of the reversed
+    digit string ("123" -> tokens of "321", EOS). `labels` and `lengths` stay left-to-right.
     """
 
     def __init__(
@@ -648,6 +658,7 @@ class SvhnSplit:
         jitter: float = 0.3,
         limit: int | None = None,
         suffix: str = "",
+        reverse: bool = False,
     ) -> None:
         imgs = np.load(Path(cache_dir) / f"{split}{suffix}_images.npy", mmap_mode="r")
         records = json.loads((Path(cache_dir) / f"{split}{suffix}_labels.json").read_text())
@@ -657,8 +668,11 @@ class SvhnSplit:
         self.labels = [r["label"] for r in records]
         x = torch.from_numpy(np.array(imgs)).to(device)  # copy: the memmap is read-only
         self.images = x.permute(0, 3, 1, 2).contiguous()
+        self.reverse = reverse
         self.tokens = torch.tensor(
-            [encode(s, max_len) for s in self.labels], dtype=torch.long, device=device
+            [encode(target_order(s, reverse), max_len) for s in self.labels],
+            dtype=torch.long,
+            device=device,
         ).reshape(-1, max_len + 1)
         self.lengths = torch.tensor(
             [len(s) - 1 for s in self.labels], dtype=torch.long, device=device

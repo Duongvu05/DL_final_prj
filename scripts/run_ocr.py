@@ -33,9 +33,21 @@ runs. The requested and active values are recorded in spec.json ("compile") and 
 requested value in fingerprint.json. Dynamo does not trace nn.GRU, so in the BiGRU control
 the GRU calls run eager (spec.json "compile.eager_in_mixer"). Train time is therefore
 compile dependent and is not a method comparison.
+
+`reverse_target: true` (config key, default false, GRU decoders only) trains a right-to-left
+decoder on the reversed digit strings (configs/phase1_task3_r2l.yaml and
+phase1_task3_whole_r2l.yaml). Its decoded strings are reversed back, so validation, metrics
+and pred files read left-to-right. spec.json gets a "reverse_target" entry. It is the
+backward model of the DRAM-style rescoring in scripts/rescore_task3.py.
+
+--nbest (GRU decoders, opt-in) also writes nbest_val.json.gz and nbest_test.json.gz: the
+finished hypotheses of the primary beam per image (width = the validation-selected width,
+or --nbest-width) with their summed and length-normalised log-probabilities and the
+length-head log-probabilities. Nothing else in the run changes.
 """
 
 import argparse
+import gzip
 import json
 import math
 import shutil
@@ -67,6 +79,8 @@ from dl_final_prj.ocr_mamba import (
 from dl_final_prj.ocr_models import (
     DECODING_TEXT,
     PRIMARY_DECODING,
+    GRUDecoderRecognizer,
+    NBest,
     build,
     decoder_family,
     primary_mode,
@@ -106,6 +120,18 @@ COMPILE_TIMING_NOTE = (
 
 def compile_requested(cfg: dict) -> bool:
     return bool(cfg.get("compile", False))
+
+
+def reverse_target(cfg: dict) -> bool:
+    """Config key `reverse_target` (default false): a right-to-left GRU decoder."""
+    return bool(cfg.get("reverse_target", False))
+
+
+REVERSE_TEXT = (
+    "right-to-left decoder: trained on the reversed digit string (tokens of label[::-1], EOS), "
+    "decoded strings reversed back, so predictions and metrics read left-to-right. The "
+    "attention steps of attention_test.npz run right-to-left"
+)
 
 
 def compile_mixer(model: MixerAttentionGRURecognizer, backend: str = "inductor") -> None:
@@ -269,6 +295,8 @@ def load_data(
     suffix = cfg.get("cache_suffix") or ""
     stress = stress_split(cfg)
     kw = {"crop": cfg["crop"], "jitter": cfg["color_jitter"]}
+    if reverse_target(cfg):  # training targets of a right-to-left decoder
+        kw["reverse"] = True
     names = [s for s in ("train", "val", "test") if train or s != "train"]
     data = {
         s: SvhnSplit(
@@ -410,6 +438,101 @@ def bench(model, a, cfg: dict, device: str, amp: bool) -> None:
         "train_h_per_run": epoch_s * fcfg.epochs / 3600 if epoch_s else None,
     }
     logger.info(f"bench {json.dumps(out)}")
+
+
+# --- n-best lists (secondary decodings, see ocr_models and scripts/rescore_task3.py) ------
+
+NBEST_FORMAT = 1
+
+
+@torch.no_grad()
+def collect_nbest(
+    model: GRUDecoderRecognizer, split: SvhnSplit, name: str, width: int, bs: int, amp: bool
+) -> NBest:
+    """n-best lists of the primary beam of `width` on one split (center crops)."""
+    model.eval()
+    hyps, len_lp = [], []
+    for b in split.iterate(bs):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            h, lp = model.nbest(b.images, width)
+        hyps += h
+        len_lp.append(lp.float().cpu().numpy())
+    return NBest.from_hyps(name, width, hyps, np.concatenate(len_lp))
+
+
+@torch.no_grad()
+def score_nbest(
+    model: GRUDecoderRecognizer, split: SvhnSplit, nb: NBest, bs: int, amp: bool
+) -> np.ndarray:
+    """Teacher-forced log-probability of every n-best hypothesis under `model` (N, K), -inf
+    padding. For a reverse_target model this is log P_R2L(reverse(hyp))."""
+    model.eval()
+    hyps, rows = nb.hyps(), []
+    for b in split.iterate(bs):
+        idx = b.index.cpu().tolist()
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            rows += model.score_strings(b.images, [hyps[i] for i in idx])
+    return nb.r2l_matrix(rows)
+
+
+def nbest_path(run_dir: Path, split: str) -> Path:
+    return run_dir / f"nbest_{split}.json.gz"
+
+
+def write_nbest(path: Path, nb: NBest, split: SvhnSplit, meta: dict) -> None:
+    """nbest_{split}.json.gz: meta plus one row per image (records order) with name, dir,
+    target, len_logp (lengths 1..5) and hyps [{pred, logp, logp_norm, n_tokens}], best
+    primary score first. pred reads left-to-right."""
+    rows = []
+    for r, preds, lp, ln, nt, ll in zip(
+        split.records, nb.preds, nb.logp, nb.logp_norm, nb.n_tokens, nb.len_logp, strict=True
+    ):
+        hyps = [
+            {"pred": p, "logp": float(a), "logp_norm": float(b), "n_tokens": int(c)}
+            for p, a, b, c in zip(preds, lp, ln, nt, strict=True)
+            if math.isfinite(a)
+        ]
+        row = {"name": r["name"], "dir": r["dir"], "target": r["label"]}
+        rows.append(row | {"len_logp": [float(x) for x in ll], "hyps": hyps})
+    out = {"format": NBEST_FORMAT, "split": nb.split, "width": nb.width} | meta | {"rows": rows}
+    with gzip.open(path, "wt") as f:
+        json.dump(out, f)
+
+
+def read_nbest(path: Path) -> tuple[NBest, dict]:
+    """(NBest, the file without rows) of a write_nbest file."""
+    with gzip.open(path, "rt") as f:
+        d = json.load(f)
+    rows = d.pop("rows")
+    hyps = [
+        [(h["pred"], h["logp"], h["logp_norm"], h["n_tokens"]) for h in r["hyps"]] for r in rows
+    ]
+    nb = NBest.from_hyps(d["split"], d["width"], hyps, np.array([r["len_logp"] for r in rows]))
+    d["keys"] = [(r["dir"], r["name"], r["target"]) for r in rows]
+    return nb, d
+
+
+def nbest_meta(model, width: int, primary_width: int | None, cfg: dict, smoke: bool) -> dict:
+    return {
+        "primary_width": primary_width,
+        "mode": f"beam{width}",
+        "reverse_target": bool(getattr(model, "reverse_target", False)),
+        "cache_suffix": cfg.get("cache_suffix") or "",
+        "smoke": smoke,
+        "score": "logp = summed log-probability of digits + EOS (PAD, SOS masked), logp_norm "
+        "= logp / n_tokens (the primary beam score)",
+    }
+
+
+def write_nbest_files(model, data, metrics: dict, run_dir: Path, cfg: dict, a, amp: bool):
+    """--nbest: nbest_val.json.gz and nbest_test.json.gz of a GRU-decoder run."""
+    primary = metrics["decoding"]["width"]
+    width = a.nbest_width or primary
+    meta = nbest_meta(model, width, primary, cfg, a.smoke)
+    for s in ("val", "test"):  # val first, as everywhere
+        nb = collect_nbest(model, data[s], s, width, cfg["eval_batch_size"], amp)
+        write_nbest(nbest_path(run_dir, s), nb, data[s], meta)
+    logger.info(f"wrote nbest_val/test.json.gz (width {width}) to {run_dir}")
 
 
 def build_spec(
@@ -565,6 +688,8 @@ def check_eval_fingerprint(fp: dict, a, cfg: dict, mcfg: dict, cache: Path, suff
     if fp.get("model") != mcfg or fp.get("seed") != a.seed:
         raise SystemExit("the run was trained with another model config or seed")
     old_cfg = fp.get("config", {})
+    if reverse_target(old_cfg) != reverse_target(cfg):
+        raise SystemExit("--eval-only: reverse_target differs from training")
 
     def norm(c: dict, k: str):  # a null cache_suffix is the empty suffix
         v = c.get(k, EVAL_DATA_KEYS[k])
@@ -613,7 +738,7 @@ def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
     device = pick_device()
     kind = mcfg["kind"]
     extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
-    model = build(kind, mcfg.get("args"), cfg["max_len"], **extra)
+    model = build(kind, mcfg.get("args"), cfg["max_len"], reverse_target(cfg), **extra)
     model.load_state_dict(strip_compile_prefix(ck["best_state"]))
     model = model.to(device).eval()
     del ck
@@ -631,6 +756,8 @@ def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
         model, data, stress, cfg["eval_batch_size"], amp, keep_attention=kind in ATTENTION_KINDS
     )
     write_eval(run_dir, metrics, preds, attention)
+    if a.nbest:
+        write_nbest_files(model, data, metrics, run_dir, cfg, a, amp)
     spec = json.loads((run_dir / "spec.json").read_text())
     spec |= decoding_spec(metrics)
     # runs trained before the two settings existed are the oracle crop setting (suffix "")
@@ -668,6 +795,10 @@ def main() -> None:
     ap.add_argument("--scan", choices=["parallel", "loop"], help="--bench only: Mamba scan")
     compile_help = "--bench only: torch.compile the mixer (runs use the config key `compile`)"
     ap.add_argument("--compile", action="store_true", help=compile_help)
+    nbest_help = "GRU decoders: also write nbest_{val,test}.json.gz (secondary decodings)"
+    ap.add_argument("--nbest", action="store_true", help=nbest_help)
+    width_help = "--nbest list width (default: the validation-selected primary width)"
+    ap.add_argument("--nbest-width", type=int, default=None, help=width_help)
     a = ap.parse_args()
 
     cfg = yaml.safe_load(Path(a.config).read_text())
@@ -682,7 +813,8 @@ def main() -> None:
         extra = (
             {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
         )
-        model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+        model = build(kind, mcfg.get("args"), cfg["max_len"], reverse_target(cfg), **extra)
+        model = model.to(device)
         fcfg = FitConfig(**cfg["fit"])
         bench(model, a, cfg, device, fcfg.amp == "bf16" and device == "cuda")
         return
@@ -690,6 +822,12 @@ def main() -> None:
         ap.error("--scan and --compile only apply to --bench (set mamba.scan in the config)")
     if a.eval_only and a.force:
         ap.error("--eval-only never retrains, do not combine it with --force")
+    if a.nbest and kind not in GRU_DECODER_KINDS:
+        ap.error("--nbest applies to the GRU decoders only")
+    if a.nbest_width is not None and (not a.nbest or a.nbest_width < 1):
+        ap.error("--nbest-width needs --nbest and a width >= 1")
+    if reverse_target(cfg) and kind not in GRU_DECODER_KINDS:
+        raise SystemExit("reverse_target: true applies to the GRU decoders only")
     phase = cfg.get("phase", "phase1")
     root = Path(a.out or cfg["results_root"]) / ("smoke" if a.smoke else phase)
     run_dir = root / "runs" / "task3" / a.model / f"seed{a.seed}"
@@ -719,7 +857,8 @@ def main() -> None:
 
     set_seed(a.seed)  # seeds the weight initialization too, not only training
     extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
-    model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+    model = build(kind, mcfg.get("args"), cfg["max_len"], reverse_target(cfg), **extra)
+    model = model.to(device)
     compile_info = apply_compile(model, cfg, device)
     fcfg = FitConfig(**cfg["fit"])
     amp = fcfg.amp == "bf16" and device == "cuda"
@@ -754,6 +893,10 @@ def main() -> None:
     )
     if isinstance(model, MixerAttentionGRURecognizer):
         spec["compile"] = compile_info
+    if reverse_target(cfg):  # only right-to-left runs get the key
+        spec["reverse_target"] = {"enabled": True, "description": REVERSE_TEXT}
+    if a.nbest:
+        write_nbest_files(model, data, metrics, run_dir, cfg, a, amp)
     write_json(history, run_dir / "history.json")
     write_json(spec, run_dir / "spec.json")
     write_eval(run_dir, metrics, preds, attention)  # metrics.json last: it marks the run done

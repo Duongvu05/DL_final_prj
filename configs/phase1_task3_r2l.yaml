@@ -1,0 +1,28 @@
+# Phase 1 Task 3, Setting A (oracle GT-box crop): right-to-left decoder for the DRAM-style
+# forward-backward rescoring of plan 2.3 (dram_fb_secondary, Ba et al. 2015).
+# Copy of configs/phase1_task3.yaml with ONE change, reverse_target true. Only the main
+# attention GRU model is trained, as cnn_attention_gru_r2l. It has the same
+# architecture, args and recipe as cnn_attention_gru.
+# The decoder learns the reversed digit string ("123" is trained as the tokens of "321",
+# EOS). Decoded strings are reversed back, so validation (checkpoint selection), metrics.json
+# and the pred files read left-to-right. Runs land in
+# results/phase1/runs/task3/cnn_attention_gru_r2l/seed*/ next to the left-to-right runs.
+# Seeds pair as L2R seed s with R2L seed s in scripts/rescore_task3.py.
+title: "Full house-number recognition from cropped SVHN images"
+seeds: [0, 1, 2]
+results_root: results
+svhn_dir: data/processed/svhn
+size: 64
+crop: 54
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit: {epochs: 16, patience: 16, lr: 3.0e-4, weight_decay: 1.0e-4, clip: 5.0, schedule: step, step_epoch: 10, step_gamma: 0.1, amp: bf16}
+length_loss_weight: 0.2
+color_jitter: 0.3
+reverse_target: true  # right-to-left targets (run_ocr.py, SvhnSplit(reverse=True))
+models:
+  cnn_attention_gru_r2l:  # course model: VGG-BN CNN + 2-D positions + Bahdanau attention 2-layer GRU (T3-P0)
+    kind: attention
+    args: {hidden: 256, layers: 2, attn_dim: 256, emb_dim: 64}
