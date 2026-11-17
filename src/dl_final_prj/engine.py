@@ -74,6 +74,9 @@ class FitConfig:
     plateau_patience: int = 3
     plateau_factor: float = 0.5
     amp: str = "none"  # "bf16" or "none"
+    schedule: str = "plateau"  # "plateau" (ReduceLROnPlateau on val) or "step"
+    step_epoch: int = 10  # "step": multiply the lr by step_gamma after this many epochs
+    step_gamma: float = 0.1
 
 
 def fit(
@@ -91,9 +94,14 @@ def fit(
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = run_dir / "ckpt.pt"
     opt = torch.optim.AdamW(param_groups, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=cfg.plateau_factor, patience=cfg.plateau_patience
-    )
+    if cfg.schedule == "step":
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=cfg.step_epoch, gamma=cfg.step_gamma)
+    elif cfg.schedule == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=cfg.plateau_factor, patience=cfg.plateau_patience
+        )
+    else:
+        raise ValueError(f"unknown schedule {cfg.schedule}")
     start, best, bad, history = 1, float("inf"), 0, []
     best_state = copy.deepcopy(model.state_dict())
     if ckpt_path.exists():
@@ -128,7 +136,10 @@ def fit(
         model.eval()
         with torch.no_grad():
             val = float(validate(model))
-        sched.step(val)
+        if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            sched.step(val)
+        else:
+            sched.step()
         improved = val < best
         if improved:
             best, bad = val, 0

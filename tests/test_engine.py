@@ -58,3 +58,12 @@ def test_resume_matches_uninterrupted_run(tmp_path):
     assert [round(h["val"], 10) for h in h1] == [round(h["val"], 10) for h in h3]
     for a, b in zip(full.state_dict().values(), resumed.state_dict().values()):
         torch.testing.assert_close(a, b)
+
+
+def test_step_schedule_drops_lr_and_resumes(tmp_path):
+    batches, step, val = _setup()
+    cfg = FitConfig(epochs=4, patience=10, lr=1e-2, schedule="step", step_epoch=2, step_gamma=0.1)
+    m = _model()
+    _, h = fit(tmp_path / "s", m, [{"params": m.parameters()}], batches, step, val, cfg, seed=0)
+    lrs = [round(r["lr"], 6) for r in h]
+    assert lrs == [0.01, 0.001, 0.001, 0.0001]

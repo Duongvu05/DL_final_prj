@@ -1,0 +1,360 @@
+[
+ {
+  "sources": [
+   {
+    "url": "https://arxiv.org/pdf/1312.6082",
+    "title": "Goodfellow et al. 2014, Multi-digit Number Recognition from Street View Imagery using Deep CNNs (Sec 5.1, read from the PDF text)",
+    "preprocessing": "Quote: 'first we find the small rectangular bounding box that will contain individual character bounding boxes. We then expand this bounding box by 30% in both the x and the y direction, crop the image to that bounding box and resize the crop to 64 x 64 pixels. We then crop a 54 x 54 pixel image from a random location within the 64 x 64 pixel image.' Aspect ratio is not kept, because the box is resized straight to 64x64. Without the random-shift augmentation 'we lose about half a percentage point of accuracy'. The paper says about 200k street numbers, which means train+extra were used. The test-time crop is not spelled out in Sec 5.1. The same GT-box crop is implied.",
+    "model": "8 conv hidden layers (the first is maxout), 1 locally connected layer, 2 dense layers. Softmax heads for length and for each digit.",
+    "training": "DistBelief with 10 replicas, about 6 days. The best stopping point was picked on a validation set.",
+    "reported_result": "Test sequence transcription accuracy 96.03%. Character-level accuracy 97.84%. Coverage 95.64% at 98% accuracy."
+   },
+   {
+    "url": "https://github.com/potterhsu/SVHNClassifier-PyTorch",
+    "title": "potterhsu/SVHNClassifier-PyTorch (the most widely copied PyTorch reimplementation of Goodfellow). Read README, convert_to_lmdb.py, train.py, model.py and evaluator.py.",
+    "preprocessing": "Union box is min_left/min_top/max_right/max_bottom over all digit boxes. A square is then taken with side = max(union width, union height), centered on the union. In _preprocess the crop is left - 0.15*side, top - 0.15*side, with size 1.3*side, so the expansion is 30% in total. Then image.resize([64, 64]) in RGB. Train and val both come from the train/ and extra/ folders, routed at random with p=0.1 to val. test.lmdb comes from test/ with the SAME GT-box crop. Train transform is RandomCrop([54,54]), ToTensor, Normalize(0.5,0.5). Eval transform is CenterCrop([54,54]) with the same Normalize.",
+    "model": "8 conv blocks, each Conv5x5, BN, ReLU, MaxPool and Dropout 0.2. Channels 48,64,128,160,192,192,192,192, with alternating pool strides 2/1. Flatten 192x7x7, then FC 3072 and FC 3072. Heads are length (7 classes) and digit1..digit5 (11 classes each).",
+    "training": "SGD momentum 0.9, weight decay 0.0005, StepLR. Code defaults are lr 1e-2, batch 32, decay_steps 10000, gamma 0.9, patience 100. The README result run used batch 512, lr 0.16, decay step 625, decay rate 0.9 and 54,000 steps on a GTX 1080 Ti. No other augmentation besides the random 54x54 crop.",
+    "reported_result": "README accuracy 95.65%. The README does not name the split, but evaluation runs on test.lmdb. In evaluator.py needs_include_length=False, so a sample counts as correct when all 5 digit heads match. Padding positions use label 10, so length is checked implicitly."
+   },
+   {
+    "url": "https://github.com/potterhsu/SVHNClassifier",
+    "title": "potterhsu/SVHNClassifier (TensorFlow original). Read README and convert_to_tfrecords.py.",
+    "preprocessing": "Identical to the PyTorch version. Union of digit boxes, square with side = max(w,h), expand by 0.15 per side (1.3x), resize 64x64. train/ and extra/ go 90/10 into train/val. test/ is cropped with GT boxes the same way.",
+    "model": "Goodfellow-style multi-head CNN (same author as the PyTorch port).",
+    "training": "Not stated in the README beyond the train.py command.",
+    "reported_result": "'Accuracy 93.45% on test dataset after about 14 hours.'"
+   },
+   {
+    "url": "https://github.com/JennyVanessa/Paddle-SVHN",
+    "title": "JennyVanessa/Paddle-SVHN (PaddlePaddle reproduction of Goodfellow, based on the potterhsu pipeline)",
+    "preprocessing": "Not described in the README. It uses the same LMDB layout as potterhsu, with train/test/extra folders and digitStruct.mat.",
+    "model": "Reproduction of Goodfellow et al.",
+    "training": "Table lists batch 1024, lr 0.01, patience 100, decay step 625, decay rate 0.9. The training log instead shows lr 0.1 decaying to 0.09 at step 800. Checkpoint model-359000.",
+    "reported_result": "Table gives 95.71% (and 95.65% for the PyTorch reference). The eval log shows accuracy = 0.953551 on test.lmdb."
+   },
+   {
+    "url": "https://github.com/k-chuang/tf-svhn",
+    "title": "k-chuang/tf-svhn (README and svhn-preprocessing.ipynb, first 100k chars read)",
+    "preprocessing": "Format 1. The union box comes from the min (left, top) and max (right, bottom) over the digit boxes. The notebook says 'Expand the width & height (x & y) of each image by 35%' (its plan says 30-40%). Resize to 32x32, grayscale, z-score with train mean and std. Uses train, test and extra (33,401 / 13,068 / 202,353). The README gives 225,754 train, 10,000 val and 13,068 test. Test images are cropped from their GT boxes the same way, per the README description of the pipeline.",
+    "model": "3 blocks of 2 convs (conv, BN, leaky ReLU, avg pool), then 2 dense layers with leaky ReLU, then 5 parallel softmax heads. Xavier init.",
+    "training": "Batch 512, 80 epochs. Optimizer and lr not stated in the README.",
+    "reported_result": "Multi-digit test accuracy 94.399%. Individual digit test accuracy 96.620%. Digit F1 0.9643."
+   },
+   {
+    "url": "https://raw.githubusercontent.com/hangyao/street_view_house_numbers/master/3_preprocess_multi.ipynb",
+    "title": "hangyao/street_view_house_numbers, 3_preprocess_multi.ipynb",
+    "preprocessing": "Union box is im_top=min(top), im_left=min(left), with height and width out to the farthest box edge. Expansion is im_top - 0.1*h and im_left - 0.1*w, and the bottom/right is top + 1.2*h, clipped to the image. So the margin is 10% on each side, 20% in total. Resize 32x32 (ANTIALIAS), then grayscale. Max 5 digits, and the one 6-digit train image (index 29929) is removed. Train+extra are combined (230,070 samples). Val is 400 per class from train plus 200 per class from extra (5,684 total). Test is cropped with its own GT boxes.",
+    "model": "TensorFlow CNN (4_CNN_multi.ipynb, not read).",
+    "training": "Not read.",
+    "reported_result": "Not reported in the parts I read."
+   },
+   {
+    "url": "https://raw.githubusercontent.com/PacktPublishing/Machine-Learning-for-Algorithmic-Trading-Second-Edition/master/18_convolutional_neural_nets/12_svhn_preprocessing.ipynb",
+    "title": "Packt ML for Algorithmic Trading 2nd ed., 12_svhn_preprocessing.ipynb (companion 13_svhn_object_detection.ipynb not read)",
+    "preprocessing": "Same code as hangyao. Union box with a 10% margin before top/left and a 1.2x extent, clipped to the image. Resize 32x32 ANTIALIAS, (im-128)/128. Labels are [count, d1..d5]. Uses only the 'train' and 'test' folders (no extra). Test is cropped with GT boxes.",
+    "model": "The companion notebook is a Keras functional CNN that predicts the digit count plus each digit (per the folder README).",
+    "training": "Not read.",
+    "reported_result": "None in the preprocessing notebook."
+   },
+   {
+    "url": "https://github.com/carysva/Multi-Digit_Number_Recognition",
+    "title": "carysva/Multi-Digit_Number_Recognition (UTK course project, same 33,402/13,068 split as the user's)",
+    "preprocessing": "preprocess_svhn.py 'crops to a tight box around all digit bounding boxes (with padding)'. The padding amount and resize size are not stated in the README. Digits are sorted left to right. Labels are [length, d1..d5]. Extra is not mentioned.",
+    "model": "EfficientNetB0 (ImageNet) with a shared dense trunk (BN, ReLU, Dropout). Six softmax heads, one for length (6 classes) and five for digits (11 classes each).",
+    "training": "3 phases with 'higher LR', 'low LR' and 'very low LR', plus clipnorm 1.0, ReduceLROnPlateau and early stopping. Exact values not given.",
+    "reported_result": "Whole-number accuracy 82.31%. The README does not explicitly say this is test. Length head about 96.8%. Digit heads about 92.6-100%."
+   },
+   {
+    "url": "https://github.com/beeps82/SVHN_CNN",
+    "title": "beeps82/SVHN_CNN",
+    "preprocessing": "Not described in the README beyond converting .mat to .h5 (helper.prepDataForCNN).",
+    "model": "A custom CNN, VGG-16, and ImageNet-pretrained VGG-16 (Keras).",
+    "training": "About 150,000 samples used for training. Other details not given.",
+    "reported_result": "Sequence test accuracy is 91.24% for pretrained VGG-16, 85.40% for the custom CNN and 82.16% for VGG-16 from scratch."
+   },
+   {
+    "url": "https://github.com/pavitrakumar78/street-view-house-numbers-svhn-detection-and-classification-using-cnn",
+    "title": "pavitrakumar78 (two-stage: box regression, then crop, then classify)",
+    "preprocessing": "The whole image is resized to 64x64, grayscaled and normalized. A detection CNN regresses one box around all digits. At TEST time the crop comes from the PREDICTED box, which is then resized to 64x64 for the classifier. No margin stated.",
+    "model": "Box-regression CNN plus a multi-output digit CNN (up to 4 digits). Keras 2.0.5.",
+    "training": "Detection was augmented by shifting GT boxes (about 5% better detection). Classifier not augmented.",
+    "reported_result": "Full pipeline exact-match test accuracy is only 51%. Per-position accuracy 71%, 65%, 84% and 98%."
+   },
+   {
+    "url": "https://huggingface.co/MuGeminorum/SVHN-Recognition",
+    "title": "MuGeminorum/SVHN-Recognition (Hugging Face)",
+    "preprocessing": "Not stated.",
+    "model": "PyTorch deep CNN (cites 1312.6082).",
+    "training": "Not stated.",
+    "reported_result": "'89%' with no split or metric defined."
+   },
+   {
+    "url": "https://www.kaggle.com/datasets/stanfordu/street-view-house-numbers/code",
+    "title": "Kaggle SVHN dataset code tab (page could NOT be read)",
+    "preprocessing": "Unreadable. WebFetch returns only the page title because Kaggle renders with JavaScript. A search snippet showed notebook titles 'Number_recognition_using_CRNN_and_CTC_loss' and 'SVHN_CNN_CRNN+CTC+Loss_File' on this listing. I could not open them.",
+    "model": "Unknown",
+    "training": "Unknown",
+    "reported_result": "Unknown. Other Kaggle pages I tried also returned only their titles: kaggle.com/general/29281 'Recognising Multi Digit Images (SVHN dataset)' and kaggle.com/code/hugovallejo/cnn-mlp-street-view-numbers-recognition."
+   }
+  ],
+  "takeaways": [
+   "I could not read any Kaggle notebook. Kaggle pages render with JavaScript, so WebFetch got only titles. The permission system blocked two other routes. One was the Kaggle API with the ~/.kaggle/kaggle.json credentials, the other was anonymous session cookies. I did not try further. The notebook titles I saw ('Number_recognition_using_CRNN_and_CTC_loss', 'SVHN_CNN_CRNN+CTC+Loss_File') remain unverified. To get real Kaggle notebook content, the user must allow the kaggle CLI or Kaggle API ('kaggle kernels list -s svhn' and 'kaggle kernels pull'), or paste the notebooks in.",
+   "Every public Format-1 pipeline I read crops to the union of the digitStruct boxes. They do this at train AND test time, and the test crop uses the test set's own ground-truth boxes. This covers Goodfellow, potterhsu TF and PyTorch, Paddle-SVHN, k-chuang, hangyao, Packt and carysva. None of them feeds the whole image. So their ~94-96% numbers are on GT-cropped test images.",
+   "Margins differ by repo. Goodfellow and potterhsu expand by 30% (potterhsu takes a square with side max(w,h), then 0.15*side per side, so 1.3x). k-chuang uses 35%. hangyao and Packt use 10% per side (1.2x). Aspect ratio is not kept. Crops go straight to 64x64 (Goodfellow, potterhsu) or 32x32 (k-chuang, hangyao, Packt).",
+   "The canonical recipe (Goodfellow, potterhsu) is as follows. Crop the union box, expand it 30%, and resize to 64x64 RGB. Train on a random 54x54 crop and test on a center 54x54 crop. Normalize with mean and std 0.5. Train on train+extra with a random 10% for val. potterhsu used SGD momentum 0.9, wd 5e-4, StepLR (gamma 0.9). The README run used batch 512, lr 0.16 and 54k steps, reaching 95.65%. The TF version reports 93.45% test after about 14 h. Paddle reports 95.71% in its table, while its eval log shows 0.953551 on test.",
+   "Most of these repos use the extra set (Goodfellow, potterhsu, Paddle, k-chuang, hangyao). Packt uses train/test only, and carysva does not mention extra. carysva has the same 33,402/13,068 split as the user and no stated use of extra. With EfficientNetB0 and multi-head softmax it reports 82.31% whole-number accuracy. beeps82 reports 91.24% with pretrained VGG-16 on about 150k samples.",
+   "The only repo that crops from a PREDICTED box at test time (pavitrakumar78) gets just 51% exact match. So the ~95% results depend on GT test boxes. If the project crops test images with GT digitStruct boxes, it matches the common practice. The report should say so explicitly, because the current 56% whole-image test result is not comparable.",
+   "The user's errors are mainly extra or missing digits ('9' to '19', '26' to '260'). The test images are also larger than train, with a median width of 132 vs 104 px. A union-box crop would remove most background digits and scale mismatch. Resizing to a fixed size would also normalize the digit scale between train and test.",
+   "None of the pipelines I read uses a CNN+LSTM attention decoder. All are multi-head softmax CNNs, so the CNN encoder plus LSTM decoder can stay as is. To match common practice, only the preprocessing needs to change. That means a GT union-box crop with a 30% expansion at train and test, an input like 64x64 or a wider canvas, random-crop augmentation, and optionally the extra set. Note that potterhsu's accuracy ignores the length head and compares all 5 digit slots, with padding label 10."
+  ]
+ },
+ {
+  "sources": [
+   {
+    "url": "https://github.com/q19316/Pytorch-Attention-RNN-for-SVHN",
+    "title": "q19316/Pytorch-Attention-RNN-for-SVHN (PyTorch, CNN encoder + attention GRU decoder)",
+    "preprocessing": "I read data.py. compute_bbox() takes the union of all digit boxes, scales width and height by 1.3 around the box center (non-square), and crops with torchvision crop. compute_bbox is applied to the TEST split too, so test images are cropped with ground-truth test boxes. Train transform is Resize((64,64)), which distorts aspect ratio, then RandomResizedCrop((54,54), scale=(0.7,1.0)), then ColorJitter(0.5,0.5,0.5,0.5) and ToTensor. There is no mean/std normalization. Test transform is Resize((64,64)) then CenterCrop((54,54)). RGB input. Training data is train + extra merged (load_json('train') + load_json('extra')). The README says 'We would use train set and extra set for training and evaluate the final performance on test set.' The code has no separate validation split.",
+    "model": "Encoder is a VGG-style CNN with BatchNorm, cfg [64,64,M,128,128,M,256,256,M,512,512]. It uses 3x3 convs and three MaxPool(3, stride 2), so 54x54 input gives 8x downsampling to about 7x7x512 attention tokens. Decoder is a 2-layer GRUCell stack, hidden 256, with a learned initial state. Attention is additive, v^T tanh(W*feat + U*h) (the code docstring calls it Luong). Output layer is fc(concat(context, h)) with ReLU and a linear classifier. Vocabulary is the digits plus <pad>, <unk>, </s> and <s>. Inference is greedy decoding, batch size 1, until </s>.",
+    "training": "I read train.py. AdamW with lr 3e-4 on all parameters. MultiStepLR with milestone at epoch 10 (x0.1). EPOCHS=15, and the loop runs range(EPOCHS+1), so 16 passes. Batch 64. Dropout 0. Gradient clipping at norm 5. Full teacher forcing, with no scheduled sampling. Cross-entropy loss. Augmentation is RandomResizedCrop plus ColorJitter as above.",
+    "reported_result": "README states 'The default recipe can achieve ~96.2% test accuracy, which is slightly better than Goodfellow et al. (96.03%)'. The metric is exact whole-sequence match on the SVHN test split, computed in eval.py as decoded string == ground truth. Test images are cropped with ground-truth boxes."
+   },
+   {
+    "url": "https://github.com/potterhsu/SVHNClassifier-PyTorch",
+    "title": "potterhsu/SVHNClassifier-PyTorch (PyTorch Goodfellow-style multi-head CNN, ~199 stars)",
+    "preprocessing": "I read convert_to_lmdb.py. It takes the union box of all digits, then builds a SQUARE box with side max(w,h) centered on the union center. It expands this by 30% (left - 0.15*w, width*1.3), crops, and resizes to 64x64 RGB. The same GT-box crop is applied to the test set. Examples with more than 5 digits are skipped. train + extra are merged, and each image goes to val with probability 0.1 (random.random() > 0.1). Train transform is RandomCrop(54) and Normalize(0.5, 0.5). Evaluator and infer use CenterCrop(54), and infer.py does Resize(64,64) then CenterCrop(54).",
+    "model": "8 conv blocks: Conv 5x5 with [48,64,128,160,192,192,192,192] channels, BN, ReLU, MaxPool 2x2 with stride alternating 2/1, Dropout 0.2. Then FC 192*7*7 to 3072 and FC 3072 to 3072. Heads: length (7-way) and 5 digit heads (11-way, class 10 = no digit). Loss is the sum of 6 cross-entropies.",
+    "training": "SGD with momentum 0.9 and weight decay 5e-4. StepLR decays every decay_steps by gamma 0.9. README run uses batch 512, lr 0.16, decay step 625, decay rate 0.9, patience 100 (validation checks every 1000 steps), 54,000 steps on a GTX 1080 Ti. The only augmentation is random 54x54 crops.",
+    "reported_result": "README table shows 54,000 steps, batch 512, lr 0.16, accuracy 95.65%. The README does not name the split. The evaluator compares all 5 digit heads, which are padded with 10, so it is effectively an exact-sequence metric. Train-time checkpoint selection is on the val split carved from train+extra."
+   },
+   {
+    "url": "https://github.com/potterhsu/SVHNClassifier",
+    "title": "potterhsu/SVHNClassifier (TensorFlow version, same author)",
+    "preprocessing": "README requires SVHN format 1 with extra/, train/ and test/ folders, each with digitStruct.mat. Same pipeline family as the PyTorch port. I did not read this repo's converter code.",
+    "model": "Goodfellow et al. multi-head CNN. README shows the graph and says 'digit \"10\" means no digits'.",
+    "training": "Not stated in the README. Python 2.7 and TensorFlow.",
+    "reported_result": "README states 'Accuracy 93.45% on test dataset after about 14 hours'."
+   },
+   {
+    "url": "https://github.com/lixuan0023/SVHN_RNN",
+    "title": "lixuan0023/SVHN_RNN (TensorFlow, CNN encoder + LSTM decoder, Show-and-Tell style, no attention)",
+    "preprocessing": "I read convert_to_tfrecords.py. It is the same as potterhsu: square box around the union of digit boxes, 30% expansion, resize 64x64. GT boxes are also used for test. Sequences longer than 5 are skipped. train + extra are merged with a random 10% to val. The label sequence is [10 start, digits, 11 end...]. inputs.py does random_brightness (32/255), random_saturation (0.5-1.5) and random_hue (0.032), then scales to [-1,1]. I found no random crop in inputs.py.",
+    "model": "Goodfellow-style 8-conv CNN [48,64,128,160,192,192,192,192] with BN, ReLU, maxpool and dropout 0.2. Then FC 3072, FC 3072, and an image embedding of 512. The image embedding is fed once as the first LSTM input (im2txt style). Digit embedding size 512. BasicLSTM with 64 units (set in train.py), LSTM dropout keep 0.7. Softmax over 12 tokens.",
+    "training": "train.py uses plain GradientDescentOptimizer with exponential_decay. Defaults are lr 1e-2, decay_steps 10000, decay_rate 0.9, batch 32, and patience 100 with checks every 1000 steps. README says 8 Tesla K20c GPUs and 4-5 days to peak.",
+    "reported_result": "README states 96.34% test accuracy 'after about 6 days'. Test images are cropped with ground-truth boxes."
+   },
+   {
+    "url": "https://github.com/caoquanjie/SVHN-multi-digits-recogniton",
+    "title": "caoquanjie/SVHN-multi-digits-recogniton (TensorFlow Goodfellow reimplementation)",
+    "preprocessing": "README says 'generate images with bounding boxes, and resize the images to 64x64', then random 54x54 crops. convert_to_tfrecords.py uses the potterhsu square 30% box, but with an extra *1.5 factor applied to the crop coordinates (lines 45-48). This looks like a bug or an odd scaling. train + extra are merged with a random 10% to val. Test also uses GT boxes.",
+    "model": "8 conv 5x5 layers [48,64,128,160,192,192,192,192]. FC 3072 and FC 3072 with dropout. Length head with 5 classes and 5 digit heads with 11 classes.",
+    "training": "config.py: batch 32, num_step 300000, image_size 64. Optimizer not checked.",
+    "reported_result": "README says 'The recognition accuracy of this model is reached 96.04%'. svhn.log logs Test_acc every 1000 steps, with values like 0.9596, 0.9604 and 0.9615 near step 274k. So the headline looks like the best test value seen during training, which is test-set selection."
+   },
+   {
+    "url": "https://github.com/spotofleopard/Keras_SVHN",
+    "title": "spotofleopard/Keras_SVHN (Keras, Goodfellow CNN with LSTM replacing FC layers)",
+    "preprocessing": "data_loader.py reads 64x64x3 TFRecords with 'length' and 'digits' fields, which is the potterhsu/Goodfellow-style crop. The converter is not in the repo. Pixels are divided by 255. No random crop in train.py.",
+    "model": "8 Conv2D 5x5 layers [48,64,128,160,192,192,192,192] with dropout 0.3 and maxpool after every second conv, giving a 4x4x192 map. It is reshaped to 16 steps x 192 and fed to LSTM(1024), then 5 Dense softmax digit heads (11 classes). The length head is removed.",
+    "training": "Adadelta, batch 128, 50 epochs. The test set is passed as validation_data, and the checkpoint is selected on val_digits_acc, which is the test set. README says 4h33m on 2x GTX1080.",
+    "reported_result": "README states 'It reaches 95.5% after 50 epochs'. Split and metric are not stated, and the checkpoint is selected on test."
+   },
+   {
+    "url": "https://github.com/Genius-Society/svhn_recognition",
+    "title": "Genius-Society/svhn_recognition (PyTorch fork of potterhsu, framed as a course assignment, train set only)",
+    "preprocessing": "convert_to_lmdb.py uses the same square 30% expanded union box and 64x64 resize. It uses ONLY train (90/10 train/val split) and does not use extra. The README says extra 'is not recommended for use'. The README also states a test constraint that 'the positional information contained within the test.tar.gz/digitStruct.mat file must not be used as input'. Despite that, the code still crops test images using test digitStruct boxes. Train transform is RandomCrop 54 and Normalize 0.5. Eval uses CenterCrop 54.",
+    "model": "Same Goodfellow-style multi-head CNN as potterhsu (length head plus 5 digit heads).",
+    "training": "SGD momentum 0.9, weight decay 5e-4, StepLR. README params are 122,000 steps, GTX 1080 Ti, batch 512, lr 0.01, patience 100, decay step 625, decay rate 0.9.",
+    "reported_result": "README table shows accuracy 89.21%. The text says 'tested to have 89% accuracy'. train.py only evaluates on val.lmdb, so it is unclear whether 89.21% is val or test."
+   },
+   {
+    "url": "https://github.com/amourab/svhn-multidigit-recognition",
+    "title": "amourab/svhn-multidigit-recognition (Kaggle notebook, TF/Keras EfficientNetV2B0 multi-head)",
+    "preprocessing": "Notebook paths are /kaggle/working and the Kaggle dataset stanfordu/street-view-house-numbers. It crops the union of digit boxes with a margin of pad_x = 0.05*w and pad_y = 0.08*h. resize_with_padding keeps aspect ratio into a TARGET_HEIGHT 64 x TARGET_WIDTH 160 canvas. The test set goes through the same prepare_number_images, so it is cropped with GT boxes. Only 1-4 digit numbers are used (MAX_DIGITS = 4). Data is train + up to 80,000 extra (USE_EXTRA = True, MAX_EXTRA_RECORDS = 80_000), with a 10% val split and per-length minimum counts (lengths 1 and 4 oversampled).",
+    "model": "EfficientNetV2B0 with ImageNet weights, shared features, a length head (loss weight 0.5) and 4 position digit heads.",
+    "training": "Adam with clipnorm 5. Stage 1 head training for 5 epochs at lr 7e-4 (pretrained). Stage 2 fine-tuning for 25 epochs at lr 5e-5. ReduceLROnPlateau with min_lr 1e-6 and EarlyStopping. Batch 128 or 64. Keras RandomRotation, Translation, Zoom and Contrast augmentation. Mixed precision.",
+    "reported_result": "README reports on the SVHN test set exact sequence accuracy 75.40%, character accuracy 84.65% and length accuracy 95.51%. By length it gets 87.07% (1 digit), 75.75% (2), 62.47% (3) and 41.10% (4)."
+   },
+   {
+    "url": "https://github.com/shudhanshurp/SVHN_Detection",
+    "title": "shudhanshurp/SVHN_Detection (Kaggle notebook, CNN multi-head vs CRNN-CTC)",
+    "preprocessing": "Kaggle notebook (/kaggle/input/street-view-house-numbers). It crops to bounding boxes and resizes to 64x64 (resize_image dims=(64,64)). Images are converted to grayscale and normalized. The CTC part loads a Kaggle pickle 'svhn-preprocess-data-64x64/SVHN_multi.pickle' with train/valid/test arrays. Augmentation includes random rotation (+-5 deg), color perturbation and random crops around the boxes.",
+    "model": "Model 1 is a multi-head CNN. Model 2 is a CRNN with conv layers, LSTM(256, return_sequences) with dropout 0.3 and l2 1e-4, LayerNorm and a softmax over classes, trained with Keras ctc_batch_cost and decoded with ctc_decode.",
+    "training": "Adam lr 0.001 with clipnorm 1.0. Loss is ctc_loss_with_label_smoothing. Cosine decay with a 5-epoch warmup. Early stopping on the validation split.",
+    "reported_result": "README reports the CNN at 92.82% individual accuracy and 76.33% sequence accuracy. The CRNN with CTC gets 89.13% individual and 64.03% sequence accuracy. The split is not stated, but the notebook predicts on test_images."
+   },
+   {
+    "url": "https://github.com/hangyao/street_view_house_numbers",
+    "title": "hangyao/street_view_house_numbers (TensorFlow, Udacity-style multi-head CNN)",
+    "preprocessing": "I read 3_preprocess_multi.ipynb. It crops the union of digit boxes expanded by 10% each side (1.2x), clipped to the image. It resizes to 32x32, converts to grayscale, and does per-image mean/std normalization. train + extra are used, with valid built from parts of both. Test uses GT boxes.",
+    "model": "LeNet-like CNN with depths 16/32/64, 5x5 patches, a hidden layer of 64 and dropout. Five softmax position heads. The labels array also holds the length.",
+    "training": "Adagrad with exponential_decay(0.05, step, 10000, 0.95). Batch 64. 100,001 steps.",
+    "reported_result": "Notebook output shows 'Validation accuracy: 93.0%' and 'Test accuracy: 93.7%'. The accuracy() function averages argmax == label over all positions, so this is per-position (character-level including blanks) accuracy, NOT sequence accuracy."
+   },
+   {
+    "url": "https://github.com/pitsios-s/SVHN-Thesis",
+    "title": "pitsios-s/SVHN-Thesis (TensorFlow thesis project)",
+    "preprocessing": "README says svhn.py 'crops them around the bounding boxes of every digit and resize them to 64x64 pixels', with options for max digit length, grayscale and normalization.",
+    "model": "TensorFlow CNN. Details not in the README.",
+    "training": "Not stated in the README.",
+    "reported_result": "README full numbers results are 'single accuracy ... 96.87%' (per digit) and 'multi accuracy a 87.68%' (whole number). Cropped single digits reach 95.74%. Split not stated."
+   },
+   {
+    "url": "https://github.com/beeps82/SVHN_CNN",
+    "title": "beeps82/SVHN_CNN (Keras, up to 4 digits)",
+    "preprocessing": "Not described in the README. It reformats .mat to .h5 via helper.prepDataForCNN and trains on about 150,000 samples.",
+    "model": "Own CNN, VGG16 from scratch, and VGG16 with ImageNet weights. Outputs up to 4 digits.",
+    "training": "Not stated in the README. It points to Report.pdf.",
+    "reported_result": "README sequence accuracy (train/val/test). VGGPreTrain 96.62/87.91/91.24. VGG16 90.8/86.87/82.16. Designed CNN 91.53/87.99/85.40."
+   },
+   {
+    "url": "https://github.com/shksa/Multi-Digit-number-recognition-in-natural-images",
+    "title": "shksa/Multi-Digit-number-recognition-in-natural-images (PyTorch + Keras)",
+    "preprocessing": "Not described in the README. It is in DATA PREP.ipynb, which I did not read. The main model is trained on images with 1-3 numbers.",
+    "model": "Five position classifiers with BN, dropout, max-norm constraints and He init. A digit head gets gradient only if that position exists.",
+    "training": "Not stated in the README.",
+    "reported_result": "README says 'Acheived a test accuracy of 91%'. Model and metric not specified."
+   },
+   {
+    "url": "https://arxiv.org/pdf/1312.6082",
+    "title": "Goodfellow et al. 2014, Multi-digit Number Recognition from Street View Imagery (reference protocol that the repos copy)",
+    "preprocessing": "Quote: 'first we find the small rectangular bounding box that will contain individual character bounding boxes. We then expand this bounding box by 30% in both the x and the y direction, crop the image to that bounding box and resize the crop to 64 x 64 pixels. We then crop a 54 x 54 pixel image from a random location within the 64 x 64 pixel image.' Without this augmentation they 'lose about half a percentage point'. The paper describes about 200k street numbers, so train + extra.",
+    "model": "8 conv hidden layers, 1 locally connected layer and 2 FC layers of 3,072 units. Channels [48,64,128,160] then 192. 5x5 kernels, maxout in the first layer, max pooling with stride alternating 2/1, subtractive normalization, and dropout on all hidden layers.",
+    "training": "About six days on 10 DistBelief replicas. Stopping point picked on a validation set.",
+    "reported_result": "Best model sequence transcription accuracy 96.03%. 95.64% coverage at 98% accuracy. Character-level accuracy 97.84%."
+   },
+   {
+    "url": "https://arxiv.org/pdf/1412.7755",
+    "title": "Ba, Mnih, Kavukcuoglu 2015, Multiple Object Recognition with Visual Attention (DRAM, includes a less-cropped SVHN experiment)",
+    "preprocessing": "Follows Goodfellow, with tightly cropped 64x64 images and 54x54 jitter. Validation is 5000 images sampled from train + extra, and training uses the remaining 200,000. RGB is converted to grayscale. A second dataset uses 110x110 'less cropped' images made by enlarging the box so digit size matches the 54x54 images.",
+    "model": "Deep recurrent attention model with a glimpse CNN and 2-layer LSTM, 3 glimpses per digit, and a forward-backward (right-to-left) pair. The baseline is a 10-layer CNN with 8 conv layers of 128 filters plus 2 FC layers of 3096 units.",
+    "training": "About 3 days on a GPU for the attention model. Fine-tuning on 110x110 takes a few hours, compared with about a week for the CNN.",
+    "reported_result": "Table 3 whole-sequence test error on 54x54: Goodfellow 11-layer CNN 3.96%, 10-layer CNN 4.11%, single DRAM 5.1%, single DRAM MC avg 4.4%, forward-backward DRAM MC avg 3.9%. Table 4 on enlarged 110x110: 10-layer CNN resize 50%, CNN retrained 5.60%, single DRAM focus 5.7%, F-B DRAM focus 5.0%, single DRAM fine-tuned 5.1%, F-B DRAM fine-tuning 4.46%. The text notes 'The DRAM often over predicts additional digits in the place of the terminal class'."
+   }
+  ],
+  "takeaways": [
+   "Every GitHub/Kaggle result at or above 93% sequence accuracy that I read crops BOTH train and test images with the ground-truth union box from digitStruct.mat. This holds for potterhsu 95.65%, q19316 about 96.2%, SVHN_RNN 96.34% and caoquanjie 96.04%. The ~96% figures therefore measure recognition on GT-localized crops. The project's whole-image setup (no crop at test) is a harder task and not directly comparable.",
+   "The de facto Kaggle/GitHub protocol is the Goodfellow one. Take the union of digit boxes and expand it by 30%. potterhsu, SVHN_RNN and Genius-Society first make it square with side max(w,h). q19316 keeps it rectangular. Then crop, resize to 64x64, and take a random 54x54 crop for training and a center 54x54 crop for test. Most repos also merge train + extra and hold out a random 10% as val.",
+   "The repo closest to the course requirement is q19316/Pytorch-Attention-RNN-for-SVHN. It uses a CNN encoder (VGG-BN, 54x54 input, about 7x7x512 tokens) and a 2-layer GRU with additive attention, hidden 256. Training uses AdamW 3e-4, batch 64, 15 epochs with lr x0.1 at epoch 10, grad clip 5, full teacher forcing, RandomResizedCrop(54, scale 0.7-1) and ColorJitter 0.5, on train + extra. It reaches about 96.2% exact-sequence test accuracy. The current project recipe (AdamW 3e-4, hidden 256, attention decoder) is already similar. The main differences are the GT-box crop at train and test time and the use of extra.",
+   "Without the extra set, numbers drop. Genius-Society (train only, Goodfellow CNN) reports 89.21%, but the code evaluates on val, so the split is ambiguous. Kaggle notebooks with weaker or partial setups report much lower sequence accuracy. amourab (EfficientNetV2B0, GT crops, aspect-kept 64x160, train + 80k extra) gets 75.40% test sequence. shudhanshurp gets 76.33% with a CNN multi-head and 64.03% with CRNN-CTC on 64x64 grayscale GT crops.",
+   "A CRNN-CTC repo on SVHN with a strong reported number was not found on GitHub. The only CRNN-CTC SVHN result I read is the Kaggle notebook at 64.03% sequence accuracy, below its own multi-head CNN. This suggests that CTC is not what the high-scoring public implementations use.",
+   "Ba et al. show the scale/context effect directly. A CNN trained on tight 54x54 crops and applied to 110x110 less-cropped images by resizing has 50% sequence error. Retraining on 110x110 gives 5.60%, and a two-pass 'focus' (localize, crop 54x54, re-read) gives 5.0-4.46%. Their attention model 'often over predicts additional digits in the place of the terminal class', the same failure as the project's '9' -> '19' and '26' -> '260'. A right-to-left backward model combined with the forward one fixed it.",
+   "Metric and selection caveats when citing repos. hangyao's 93.7% 'Test accuracy' is per-position accuracy, not sequence accuracy. caoquanjie's 96.04% is the best value among test evaluations logged every 1000 steps (test-set selection), and its crop code has an extra *1.5 coordinate factor. Keras_SVHN selects its checkpoint on the test set. potterhsu and its forks skip examples longer than 5 digits. potterhsu's evaluator ignores the length head but compares 5 padded digit heads, which is effectively exact match.",
+   "Genius-Society's README states the assignment rule that test digitStruct positions must not be used as input, yet its code still crops test images with GT boxes. If the course has the same rule, the honest options are reporting the whole-image result, or a two-stage pipeline (predict the number box on the full image, crop with 30% expansion, then read with the CNN + attention decoder). The GT-crop protocol should be reported only as an oracle upper bound.",
+   "Not verified and not included as sources: an IEEE paper on CNN+LSTM multi-digit recognition (92.53%, seen only in a search snippet), the CRNN 'Memory Matters' paper's about 0.91 SVHN accuracy (snippet only) and STN-OCR SVHN numbers (the repo README gives none). Kaggle notebook pages were not fetched directly. The two Kaggle notebooks above were read through their GitHub copies."
+  ]
+ },
+ {
+  "sources": [
+   {
+    "url": "https://arxiv.org/abs/1312.6082 (PDF https://arxiv.org/pdf/1312.6082, v4)",
+    "title": "Goodfellow, Bulatov, Ibarz, Arnoud, Shet - Multi-digit Number Recognition from Street View Imagery using Deep Convolutional Neural Networks (ICLR 2014)",
+    "preprocessing": "Sec 5.1 verbatim. Find the small rectangle containing all character boxes. Expand it by 30% in both x and y. Crop to it and resize the crop to 64x64 (no aspect preservation is mentioned, the paper notes this causes scale variability since 1-digit numbers fill the box and 5-digit ones are shrunk). Take a 54x54 crop from a random location of the 64x64 image. Without this random-shift augmentation they lose about half a percentage point. Test-time crop is not described in the paper. Extra set is not named explicitly. The paper calls SVHN 'about 200k street numbers', which only matches train+extra. Validation set used to pick the stopping point. Internal Street View set (Sec 5.2) has no GT boxes. They estimate the number centroid automatically and crop 128x128 without rescaling, no random-translation augmentation.",
+    "model": "8 conv + 1 locally connected + 2 fully connected hidden layers. First layer maxout (3 filters/unit), rest ReLU. Units [48,64,128,160] then 192. FC layers 3,072 units. 5x5 kernels, 2x2 max pool with stride alternating 2/1, subtractive normalization. Outputs a length softmax plus per-position digit softmaxes (max 5 digits).",
+    "training": "DistBelief, about 6 days on 10 replicas. Dropout on all hidden layers but not the input. Optimizer and lr not given in the text I read.",
+    "reported_result": "SVHN test, cropped protocol. 96.03% sequence transcription accuracy. 97.84% character accuracy. 95.64% coverage at 98% accuracy. Internal Street View (uncropped 128x128 centroid crops, tens of millions of images) 91% sequence accuracy, 83% coverage at 99% accuracy, 89% coverage at 98%. No with/without-extra comparison is reported."
+   },
+   {
+    "url": "https://arxiv.org/abs/1412.7755",
+    "title": "Ba, Mnih, Kavukcuoglu - Multiple Object Recognition with Visual Attention (DRAM, ICLR 2015)",
+    "preprocessing": "Sec 4.3. Validation set of 5000 images sampled randomly from training set and extra set. Train on the remaining 200,000 images (so extra IS used). Goodfellow preprocessing to tightly cropped 64x64 images with digits at the center, 54x54 jittered crops in training. RGB converted to grayscale (they say color does not affect final performance). Also builds a less-cropped 110x110 set by enlarging the box so digits keep the same relative size as in 54x54.",
+    "model": "Recurrent attention model, glimpse network of 3 conv layers (5x5 then 3x3, filters 64,64,128), 2-layer LSTM with 512 units per layer, FC modules with 1024 ReLU units. 3 glimpses per digit, up to 18 glimpses (5x3 + 3 for terminal). Forward (left-to-right) and backward (right-to-left) models combined. Baseline 10-layer CNN (8 conv x128 filters + 2 FC of 3096 ReLU, dropout 0.5 on all 10 layers).",
+    "training": "SGD with Nesterov momentum 0.9, mini-batch 128, lr 0.01 decayed by factor 0.97 per epoch. About 3 days on one GPU for SVHN. 10-layer CNN on 110x110 took about one week, DRAM fine-tuning a few hours.",
+    "reported_result": "Table 3, whole-sequence test error, cropped 54x54. 11-layer CNN Goodfellow 3.96%. 10-layer CNN 4.11%. Single DRAM 5.1%. Single DRAM MC avg 4.4%. Forward-backward DRAM MC avg 3.9%. Table 6 small DRAM 5.1%, with dropout 4.6%. Table 4, enlarged 110x110 (less cropped). 10-layer CNN trained on 54x54 then applied with resize 50% error. 10-layer CNN re-trained 5.60%. Single DRAM focus 5.7%. F-B DRAM focus 5.0%. Single DRAM fine-tuned 5.1%. F-B DRAM fine-tuning 4.46%. Text notes DRAM 'often over predicts additional digits in the place of the terminal class', which motivated the backward model."
+   },
+   {
+    "url": "https://arxiv.org/abs/1506.02025",
+    "title": "Jaderberg, Simonyan, Zisserman, Kavukcuoglu - Spatial Transformer Networks (NeurIPS 2015)",
+    "preprocessing": "Sec 4.2 and A.5. Follows [Ba, Goodfellow]. 64x64 crops around each digit sequence (64px). Also a looser 128x128 crop set with more background (128px) as in DRAM. Dataset described as around 200k real images (train+extra implied, not stated explicitly). Validation set of 5k images from the training set.",
+    "model": "Baseline CNN conv[48]-max-conv[64]-conv[128]-max-conv[160]-conv[192]-max-conv[192]-conv[192]-max-conv[192]-fc3072 x3, ReLU, five parallel fc[11] softmax with null class. ST-CNN Single has a spatial transformer before conv1 (4-layer loc net). ST-CNN Multi has 4 transformers before the first 4 conv layers (fc32-fc32 loc nets). Affine + bilinear.",
+    "training": "From scratch, SGD batch 128, 400k iterations, base lr 0.01 divided by 10 every 80k iterations, weight decay 0.0005, dropout 0.5 on all layers except first conv and loc nets. Loc-net lr is 0.1x base. Average of 2 seeds.",
+    "reported_result": "Table 2, sequence error. 64px - Maxout CNN 4.0, CNN (ours) 4.0, DRAM* 3.9, ST-CNN Single 3.7, ST-CNN Multi 3.6. 128px - CNN 5.6, DRAM* 4.5, ST-CNN Single 3.9, ST-CNN Multi 3.9. DRAM* uses model and MC averaging."
+   },
+   {
+    "url": "https://arxiv.org/abs/1911.04365",
+    "title": "He, Cao, Zhang - Conditionally Learn to Pay Attention for Sequential Visual Task (2019)",
+    "preprocessing": "Sec 4.2. Uses train, extra and test (~240k total). States 'our model was trained by using the extra set and the testing set' (wording as written). Bbox setting: digits cropped with GT boxes, resized 64x64, random 54x54 crops, labels padded to 5 with dummy class 10. Uncropped (weakly supervised) setting Sec 4.3: no GT boxes, original images resized to 64x64 and randomly cropped to 54x54, for both training and testing.",
+    "model": "VGG-style CNN with LSTM and conditional attention (att1 single scale, att2 multi-scale). Baselines 11-layer CNN, standard soft attention (Show-Attend-Tell style), modified soft attention.",
+    "training": "Adam, mini-batch 32, lr 1e-4, TensorFlow 1.9, RTX 2080Ti.",
+    "reported_result": "Table 2, whole-sequence test accuracy WITH bbox crops. 11-layer CNN 96.04%, 10-layer CNN 95.89%, DRAM 94.9%, ST-CNN Single 96.30%, ST-CNN Multi 96.40%, standard soft attention 96.47%, modified soft attention 96.08%, conditional att1 96.98%, conditional att2 97.15%. Table 3, WITHOUT bbox (full original images resized to 64x64): 11-layer CNN 70.58%, standard soft attention 74.89%, modified soft attention 77.61%, conditional att1 79.04%, conditional att2 80.45%."
+   },
+   {
+    "url": "https://arxiv.org/abs/1706.03581",
+    "title": "Ablavatski, Lu, Cai - Enriched Deep Recurrent Visual Attention Model for Multiple Object Recognition (EDRAM, WACV 2017)",
+    "preprocessing": "Test set of 13k images, rest of data (train and extra) used for training. Tightly cropped 64x64 images, 54x54 jittered crops in training, RGB to grayscale.",
+    "model": "Recurrent attention with spatial-transformer glimpse, 34x34 extraction window, stacked LSTM, forward-backward ensemble. 11M params single, 22M double.",
+    "training": "Initial lr 1e-4, mini-batch 128, 5 days on one GPU.",
+    "reported_result": "Whole-sequence test error, as listed in Yousef et al. Table 2 (I read that table, the EDRAM table itself was truncated in my extract). EDRAM Single 4.36%, EDRAM Double 3.6%."
+   },
+   {
+    "url": "https://arxiv.org/abs/1812.11894",
+    "title": "Yousef, Hussain, Mohammed - Accurate, Data-Efficient, Unconstrained Text Recognition with Convolutional Neural Networks (2018)",
+    "preprocessing": "SVHN described as about 249k images, 235k for training and validation (so extra used) and 13k test. Validation set of 5k images from the training set. Grayscale. Cropped digits resized to 32x32 (they note most literature uses 64x64).",
+    "model": "Fully convolutional gated CNN, 4(128,512) with 0.9M params and 4(128,1024) with 3.4M params.",
+    "training": "Initial lr 5e-3 exponentially decayed to 0.1x after 9x10^4 batches. Single TITAN Xp. Their own augmentations from Sec 3.3.",
+    "reported_result": "Table 2, whole-sequence error on SVHN test. Ours 4(128,512) 3.3%, Ours 4(128,1024) 3.1%. Same table lists Maxout CNN 3.96, Single DRAM 5.1, Single DRAM MC 4.4, Double DRAM MC 3.9, ST-CNN Single 3.7, ST-CNN Multi 3.6, EDRAM Single 4.36, EDRAM Double 3.6 (all 64x64 input)."
+   },
+   {
+    "url": "https://arxiv.org/abs/1601.01100",
+    "title": "Guo, Tu, Li, Lei - Memory Matters: Convolutional Recurrent Neural Network for Scene Text Recognition (2016)",
+    "preprocessing": "Uses the full-number version with 33,402 training and 13,068 test images (no extra mentioned). Full-number images normalized to height 32 with aspect ratio kept, then 32x20 sliding-window frames. Whether a bbox crop is applied first is not stated in the text I read. Frame CNN is trained separately on the isolated 32x32 digits (Format 2).",
+    "model": "CNN (3 conv-pool + 2 FC, 128-D frame features) feeding a 2-layer bidirectional LSTM with CTC.",
+    "training": "Frame CNN SGD lr 1e-3, momentum 0.9. CRNN details beyond that not captured.",
+    "reported_result": "Full-number SVHN test sequence accuracy. CNN frame labelling 0.23, GMM-HMM 0.56, hybrid CNN-HMM 0.81, CRNN 0.91. Table I CRNN-2-layers 0.90 (CTC error criterion, epoch 9) and 0.91 (label error criterion, epoch 10). CRNN-1-layer 0.84 / 0.86."
+   },
+   {
+    "url": "https://arxiv.org/abs/1204.3968",
+    "title": "Sermanet, Chintala, LeCun - Convolutional Neural Networks Applied to House Numbers Digit Classification (ICPR 2012)",
+    "preprocessing": "Single cropped 32x32 digit classification (Format 2), NOT multi-digit. Validation set of 6000 samples, 2/3 from train (400 per class) and 1/3 from extra (200 per class). Local contrast normalization (7x7) on Y channel of YUV plus global contrast normalization. No distortions.",
+    "model": "2-stage ConvNet with multi-stage features and Lp pooling.",
+    "training": "SGD, hyper-parameters tuned on validation.",
+    "reported_result": "Per-digit test accuracy 94.85% (ConvNet/MS/L4). Also 94.28% (SS/L2), 94.33% (MS/L2), 94.76% (MS/L12). Previous best 90.6%. Not comparable to sequence accuracy."
+   },
+   {
+    "url": "https://github.com/potterhsu/SVHNClassifier-PyTorch (code read from raw convert_to_lmdb.py, train.py, evaluator.py, model.py)",
+    "title": "potterhsu SVHNClassifier-PyTorch - widely copied reimplementation of Goodfellow et al.",
+    "preprocessing": "Union bbox of all digits, then a SQUARE box centred on it with side = max(width, height), expanded to 1.3x (left = x - 0.15*side), PIL crop, resize to 64x64. Train uses transforms.RandomCrop 54x54, evaluation uses CenterCrop 54x54, Normalize mean 0.5 std 0.5. Examples with length > 5 are skipped. Train AND extra are pooled and each image goes to val with probability 0.1 (random.random() > 0.1 -> train). Test is cropped with its own GT boxes the same way.",
+    "model": "8 conv layers 5x5 with channels 48,64,128,160,192,192,192,192, each BN + ReLU + maxpool + dropout 0.2, FC 3072 -> 3072, length head 7 classes plus 5 digit heads of 11 classes.",
+    "training": "SGD momentum 0.9, weight decay 5e-4, StepLR. README result row uses batch 512, lr 0.16, decay rate 0.9 every 625 steps, patience 100, 54,000 steps on GTX 1080 Ti.",
+    "reported_result": "README Accuracy 95.65% (eval.py evaluates test.lmdb by default). The TensorFlow version https://github.com/potterhsu/SVHNClassifier reports 'Accuracy 93.45% on test dataset after about 14 hours', same 1.3x crop, 64x64, random 54x54, train+extra."
+   },
+   {
+    "url": "https://github.com/carysva/Multi-Digit_Number_Recognition (code read from raw preprocess_svhn.py and model_svhn_v3.py)",
+    "title": "carysva Multi-Digit_Number_Recognition - university course project (UT Knoxville 2026) with the same 33,402/13,068 spec",
+    "preprocessing": "Train only (no extra). Union bbox with PADDING = 0.15 per side (30% total), clipped to image, crop, resize to 64x64 (aspect not kept). Test also cropped with its GT boxes. 90/10 train/val split with numpy seed 42. Model input resized again to 96x96. Augmentation brightness 0.2, contrast 0.7-1.3, saturation 0.7-1.3, hue 0.05, pad by 8 then random crop back to 96x96.",
+    "model": "ImageNet EfficientNetB0, shared dense + BN + ReLU + dropout, 6 softmax heads (length 0-5 and 5 digit positions of 11 classes).",
+    "training": "Adam with clipnorm 1.0, batch 48. Phase 1 heads only 5 epochs lr 1e-3. Phase 2 full unfreeze 20 epochs lr 2e-5. Phase 3 15 epochs lr 5e-6. Label smoothing 0.1 on digit heads. ReduceLROnPlateau factor 0.5 patience 3, early stopping.",
+    "reported_result": "README. Whole-number accuracy 82.31% (on test per evaluate(test_ds)). Length head about 96.8%. Version progression V1 24% -> V2 29% -> V3 82%. No isolated cropped-vs-uncropped ablation."
+   },
+   {
+    "url": "https://github.com/thomalm/svhn-multi-digit (report.pdf)",
+    "title": "thomalm - Learning to recognise multiple digits in images (Udacity MLND capstone)",
+    "preprocessing": "Union bbox expanded by 30% in both directions, crop, resize to 32x32 grayscale (aspect squeezed), images with 6+ digits removed (1 image), mean subtraction. Report lists 33,401 train, 13,068 test, 202,353 extra, but whether extra was used for training is not stated.",
+    "model": "Small ConvNet (first conv 64 filters 5x5) with per-position softmax outputs, trained on a laptop CPU.",
+    "training": "Adam, lr 7.5e-4 with step decay 0.95 every 5,000 steps, batch 64, dropout.",
+    "reported_result": "85.05% test sequence accuracy and 91.5% single-digit accuracy. Best initial model 75.33% after 6,000 batches."
+   },
+   {
+    "url": "https://github.com/k-chuang/tf-svhn",
+    "title": "k-chuang tf-svhn (README read through WebFetch summary only, not the code)",
+    "preprocessing": "Crops by bbox expanded 'by a percentage' (value not given), resized to 32x32, grayscale, z-scored. README says Format 1 but text is inconsistent. Training set listed as 225,754 images, which implies train+extra (33,402 + 202,353 minus a validation split), not stated explicitly.",
+    "model": "3 blocks of 2 conv (BN, Leaky ReLU, avg pool), 2 dense Leaky ReLU, 5 softmax heads.",
+    "training": "80 epochs, batch 512, optimizer and lr not stated.",
+    "reported_result": "Multi-digit test accuracy 94.399%, individual digit 96.620%, F1 0.9643 on the 13,068 test images."
+   }
+  ],
+  "takeaways": [
+   "Every published SVHN multi-digit result near 96% uses ground-truth digitStruct boxes on BOTH train and test. The crop is the union box of all digits, expanded 30% (Goodfellow says 30% in x and y), resized to 64x64, with a random 54x54 crop in training. Test-time crop is not stated in the paper. The common reimplementation (potterhsu) uses a 54x54 center crop at test.",
+   "The 96% papers train on train+extra (about 200k-235k images). DRAM says so explicitly (5000 val from train+extra, 200,000 for training). EDRAM and Yousef also say so explicitly. Goodfellow and STN only imply it ('about 200k'). None of these papers reports a with-vs-without-extra ablation, so I found no published number that isolates the effect of extra.",
+   "Train-only (33k) cropped results I found are lower. carysva course project 82.31% test (EfficientNetB0, 15% pad per side, 64x64 then 96x96, 90/10 split). thomalm Udacity report 85.05% test (32x32 gray, 30% expansion, extra use not stated). Guo et al. CRNN 0.91 on the 33,402/13,068 full-number split (height 32, aspect kept, bbox crop not stated).",
+   "Uncropped full-image results are much lower even with extra. He et al. 2019 resize the original image to 64x64 with random 54x54 crops and get 70.58% (11-layer CNN), 74.89% (soft attention), up to 80.45% (their conditional attention), versus 96.04%-97.15% with bbox crops. In DRAM a 54x54-trained CNN applied to looser 110x110 images got 50% error, and re-training on 110x110 got 5.60% error. STN on looser 128x128 crops got 3.9% (ST-CNN) vs 5.6% (plain CNN).",
+   "So the current 56.0% test from whole uncropped images is consistent with the uncropped literature being far below 96%. The 96% target is only comparable once the GT-box crop protocol is used on test too.",
+   "Kaggle/GitHub-style pipelines that follow Goodfellow (potterhsu) square the union box around its center (side = max(w,h)), expand 1.3x, resize 64x64, RandomCrop 54 for train, CenterCrop 54 for eval, Normalize 0.5/0.5, drop length > 5 labels, and pool train+extra with a random 10% val. With 1.3x crop this got 95.65% (PyTorch) and 93.45% (TF) test.",
+   "Goodfellow reports that removing the random 54x54 shift augmentation costs about 0.5 points of sequence accuracy.",
+   "DRAM reports that left-to-right attention decoders often over-predict extra digits instead of the end token. This matches the observed '9' -> '19' and '26' -> '260' errors. They fix it with a right-to-left backward model and a length-agreement heuristic (3.9% error vs 4.4% single).",
+   "Sermanet et al. 2012 (94.85%) is single 32x32 digit classification (Format 2), not sequence accuracy, so it is not a comparable baseline.",
+   "Not verified (could not open). IEEE 8686963 'Multi-Digit Recognition with CNN and LSTM' (search snippet said 92.53% seq) and the ResearchGate encoder-decoder paper (snippet said 96.57%). Do not cite these numbers without reading the papers.",
+   "Local copies of the extracted paper text are in /tmp/claude-1000/-home-vungocduong-dl-final-prj/3c29501b-74ce-4dfe-b0a4-0fed46b25312/scratchpad/papers (goodfellow.txt, 1412.7755.txt, 1506.02025.txt, 1911.04365.txt, 1706.03581.txt, 1812.11894.txt, 1601.01100.txt, 1204.3968.txt, repos/, thomalm/report.txt)."
+  ]
+ }
+]
