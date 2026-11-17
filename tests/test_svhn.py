@@ -916,3 +916,42 @@ def test_cache_suffix_and_no_stress_split(tmp_path):
     assert fp["data"]["path"].endswith("train_full_images.npy")
     subprocess.run([*cmd, "--eval-only"], check=True, cwd=ROOT, env=env, capture_output=True)
     check_run(run, "crnn_ctc_whole", stress=None)
+
+
+def test_setting_width_override_is_recorded(monkeypatch):
+    """--width forces the setting-level width but records this run's own validation choice."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_ocr_mod", ROOT / "scripts" / "run_ocr.py")
+    ro = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ro)
+    calls = []
+
+    def fake_predict(model, split, mode, bs, amp, keep_attention=False):
+        calls.append((split.name, mode))
+        return [split.labels[0]] * len(split.labels), None
+
+    class Split:
+        def __init__(self, name, labels):
+            self.name, self.labels = name, labels
+
+    def fake_report(split, preds):
+        acc = {"beam3": 0.9, "beam5": 0.8, "beam10": 0.7}
+        mode = calls[-1][1]
+        return {"exact_match": acc.get(mode, 0.5)}
+
+    monkeypatch.setattr(ro, "predict", fake_predict)
+    monkeypatch.setattr(ro, "report", fake_report)
+    monkeypatch.setattr(ro, "decoder_family", lambda m: "gru")
+    monkeypatch.setattr(ro, "search_widths", lambda m: (3, 5, 10))
+    monkeypatch.setattr(ro, "primary_mode", lambda m, w: f"beam{w}")
+    data = {"val": Split("val", ["1"]), "test": Split("test", ["1"])}
+    metrics, _, _ = ro.evaluate(object(), data, None, 4, False, False, setting_width=10)
+    assert metrics["decoding"]["width"] == 10 and metrics["decoding"]["own_val_width"] == 3
+    assert ("test", "beam10") in calls and "forced" in metrics["decoding"]["width_selection"]
+    try:
+        ro.evaluate(object(), data, None, 4, False, False, setting_width=7)
+    except SystemExit as e:
+        assert "candidate" in str(e)
+    else:
+        raise AssertionError("width 7 must be refused")

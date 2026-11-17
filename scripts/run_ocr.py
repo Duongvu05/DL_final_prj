@@ -195,11 +195,22 @@ def report(split: SvhnSplit, preds: list[str]) -> dict:
 
 
 def evaluate(
-    model, data: dict[str, SvhnSplit], stress: str | None, bs: int, amp: bool, keep_attention: bool
+    model,
+    data: dict[str, SvhnSplit],
+    stress: str | None,
+    bs: int,
+    amp: bool,
+    keep_attention: bool,
+    setting_width: int | None = None,
 ):
     """All Task 3 evaluations of a trained model. The width is selected on data["val"] only,
     before data["test"] is touched. Returns (metrics, predictions by metrics key, attention
-    arrays for attention_test.npz or None)."""
+    arrays for attention_test.npz or None).
+
+    setting_width forces the plan's setting-level width (argmax of the mean validation exact
+    match over seeds 0-2, computed from the runs' own val_by_width tables) instead of this
+    run's own validation choice. It must be one of the candidate widths.
+    """
     fam = decoder_family(model)
     widths = search_widths(model)
     t0 = time.time()
@@ -211,6 +222,10 @@ def evaluate(
             val_by_width[str(w)] = report(data["val"], val_preds[w])["exact_match"]
             logger.info(f"val {primary_mode(model, w)} exact {val_by_width[str(w)]:.4f}")
         width: int | None = select_width({w: val_by_width[str(w)] for w in widths})
+        if setting_width is not None:
+            if setting_width not in widths:
+                raise SystemExit(f"--width {setting_width} is not a candidate width {widths}")
+            width = setting_width
         val_primary = val_preds[width]
     else:
         width = None
@@ -239,7 +254,17 @@ def evaluate(
         "width": width,
         "candidate_widths": list(widths),
         "val_by_width": val_by_width,
-        "width_selection": WIDTH_SELECTION if widths else None,
+        "width_selection": (
+            None
+            if not widths
+            else WIDTH_SELECTION
+            if setting_width is None
+            else "setting level: argmax of the mean validation exact match over seeds 0-2 "
+            "(val_by_width of the three runs), ties to the smaller width, forced with --width"
+        ),
+        "own_val_width": select_width({w: val_by_width[str(w)] for w in widths})
+        if widths
+        else None,
         "description": DECODING_TEXT[PRIMARY_DECODING[fam]],
         "keys": {
             "val": f"primary ({mode})",
@@ -753,7 +778,13 @@ def eval_only(a, cfg: dict, mcfg: dict, run_dir: Path, cache: Path) -> None:
         logger.info(f"backed up the greedy metrics to {backup}")
     t0 = time.time()
     metrics, preds, attention = evaluate(
-        model, data, stress, cfg["eval_batch_size"], amp, keep_attention=kind in ATTENTION_KINDS
+        model,
+        data,
+        stress,
+        cfg["eval_batch_size"],
+        amp,
+        keep_attention=kind in ATTENTION_KINDS,
+        setting_width=a.width,
     )
     write_eval(run_dir, metrics, preds, attention)
     if a.nbest:
@@ -789,6 +820,12 @@ def main() -> None:
     ap.add_argument("--force", action="store_true")
     eval_help = "re-evaluate a finished run from ckpt.pt (no training) with the current decoding"
     ap.add_argument("--eval-only", action="store_true", help=eval_help)
+    ap.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="with --eval-only: force the setting-level decoding width chosen on validation",
+    )
     bench_help = "time N training steps on random data and exit, no run directory (Phase 2)"
     ap.add_argument("--bench", type=int, default=0, metavar="N", help=bench_help)
     ap.add_argument("--bench-warmup", type=int, default=5)
@@ -822,6 +859,8 @@ def main() -> None:
         ap.error("--scan and --compile only apply to --bench (set mamba.scan in the config)")
     if a.eval_only and a.force:
         ap.error("--eval-only never retrains, do not combine it with --force")
+    if a.width is not None and not a.eval_only:
+        ap.error("--width is only for --eval-only (setting-level width after all seeds finished)")
     if a.nbest and kind not in GRU_DECODER_KINDS:
         ap.error("--nbest applies to the GRU decoders only")
     if a.nbest_width is not None and (not a.nbest or a.nbest_width < 1):
