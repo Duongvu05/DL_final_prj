@@ -7,6 +7,7 @@ are reported and skipped, so this can be rerun while training is still going.
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import matplotlib
@@ -32,56 +33,67 @@ INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 COLORS = {
     "bigru_attention": "#2a78d6",
     "seq2seq_attention": "#2a78d6",
-    "cnn_attention_lstm": "#2a78d6",
+    "cnn_attention_gru": "#2a78d6",
     "bigru": "#eb6834",
     "seq2seq": "#eb6834",
-    "cnn_pool_lstm": "#eb6834",
+    "cnn_pool_gru": "#eb6834",
     "ridge": "#1baf7a",
     "crnn_ctc": "#1baf7a",
     "seasonal_weekly": "#eda100",
+    "multihead_cnn": "#eda100",
     "seasonal_daily": "#e87ba4",
+    "ridge_window": "#008300",
     "persistence": "#8a8984",
 }
-STYLES = {"persistence": ":", "seasonal_daily": "--", "seasonal_weekly": "--", "ridge": "-."}
+STYLES = {
+    "persistence": ":",
+    "seasonal_daily": "--",
+    "seasonal_weekly": "--",
+    "ridge": "-.",
+    "ridge_window": "-.",
+}
 LABELS = {
-    "bigru_attention": "Attentive BiGRU-2 (main)",
-    "bigru": "BiGRU-2, no attention",
-    "seq2seq_attention": "Attentive LSTM enc-dec (main)",
-    "seq2seq": "LSTM enc-dec, no attention",
-    "cnn_attention_lstm": "CNN + attention LSTM (main)",
-    "cnn_pool_lstm": "CNN pooled LSTM, no attention",
+    "bigru_attention": "Residual attentive BiGRU-2 (main)",
+    "bigru": "Residual BiGRU-2, no attention",
+    "seq2seq_attention": "Residual attentive LSTM enc-dec (main)",
+    "seq2seq": "Residual LSTM enc-dec, no attention",
+    "cnn_attention_gru": "CNN + attention GRU (main)",
+    "cnn_pool_gru": "CNN + GRU, no attention",
+    "multihead_cnn": "Multi-head CNN (Goodfellow)",
     "crnn_ctc": "CRNN-CTC",
-    "ridge": "Ridge (lags + calendar)",
+    "ridge": "Ridge (sparse lags + calendar)",
+    "ridge_window": "Ridge (168-h window + calendar)",
     "seasonal_weekly": "Seasonal naive, weekly",
     "seasonal_daily": "Seasonal naive, daily",
     "persistence": "Persistence",
 }
+TS_BASE = ["persistence", "seasonal_daily", "seasonal_weekly", "ridge", "ridge_window"]
 ORDER = {
-    1: ["persistence", "seasonal_daily", "seasonal_weekly", "ridge", "bigru", "bigru_attention"],
-    2: [
-        "persistence",
-        "seasonal_daily",
-        "seasonal_weekly",
-        "ridge",
-        "seq2seq",
-        "seq2seq_attention",
-    ],
-    3: ["cnn_pool_lstm", "crnn_ctc", "cnn_attention_lstm"],
+    1: [*TS_BASE, "bigru", "bigru_attention"],
+    2: [*TS_BASE, "seq2seq", "seq2seq_attention"],
+    3: ["crnn_ctc", "multihead_cnn", "cnn_pool_gru", "cnn_attention_gru"],
 }
-MAIN = {1: "bigru_attention", 2: "seq2seq_attention", 3: "cnn_attention_lstm"}
+MAIN = {1: "bigru_attention", 2: "seq2seq_attention", 3: "cnn_attention_gru"}
 CONTRASTS = {
     1: [
         ("bigru_attention", "bigru"),
+        ("bigru_attention", "ridge_window"),
         ("bigru_attention", "ridge"),
-        ("bigru_attention", "seasonal_weekly"),
+        ("bigru_attention", "seasonal_daily"),
     ],
     2: [
         ("seq2seq_attention", "seq2seq"),
+        ("seq2seq_attention", "ridge_window"),
         ("seq2seq_attention", "ridge"),
-        ("seq2seq_attention", "seasonal_weekly"),
+        ("seq2seq_attention", "seasonal_daily"),
     ],
-    3: [("cnn_attention_lstm", "cnn_pool_lstm"), ("cnn_attention_lstm", "crnn_ctc")],
+    3: [
+        ("cnn_attention_gru", "cnn_pool_gru"),
+        ("cnn_attention_gru", "multihead_cnn"),
+        ("cnn_attention_gru", "crnn_ctc"),
+    ],
 }
+OCR_MODES = ("val", "test", "test_length_constrained", "test_beam3", "test_whole")
 METRICS = ["R2", "NSE", "MAE", "RMSE"]
 OCR_METRICS = [
     *METRICS,
@@ -165,7 +177,7 @@ def ocr_tables(root: Path, runs: dict) -> None:
         for seed, d in sorted(runs[model].items()):
             met = json.loads((d / "metrics.json").read_text())
             spec = json.loads((d / "spec.json").read_text())
-            for split in ("val", "test"):
+            for split in [x for x in OCR_MODES if x in met]:
                 m = met[split]
                 rows.append(
                     {"model": model, "seed": seed, "split": split, **{k: m[k] for k in OCR_METRICS},
@@ -175,9 +187,11 @@ def ocr_tables(root: Path, runs: dict) -> None:
                 )  # fmt: skip
     df = pd.DataFrame(rows)
     df.to_csv(root / "task3_metrics_by_seed.csv", index=False)
-    summarize(df[df.split == "test"], [*OCR_METRICS, "n_params", "train_seconds"]).to_csv(
-        root / "task3_metrics_summary.csv", index=False
-    )
+    parts = []
+    for split in [x for x in OCR_MODES if x != "val" and x in set(df.split)]:
+        sm = summarize(df[df.split == split], [*OCR_METRICS, "n_params", "train_seconds"])
+        parts.append(sm.assign(split=split))
+    pd.concat(parts).to_csv(root / "task3_metrics_summary.csv", index=False)
 
 
 def model_specs(root: Path, task: int, runs: dict) -> None:
@@ -412,10 +426,11 @@ def fig_task3(runs: dict, svhn_dir: Path, figs: Path) -> None:
         rows = ok + bad
         steps = 1 + max(len(preds[i]["target"]) for i in rows)
         fig, axes = plt.subplots(
-            len(rows), steps + 1, figsize=(2.2 * (steps + 1), 0.75 * len(rows) + 0.5)
+            len(rows), steps + 1, figsize=(1.4 * (steps + 1), 1.5 * len(rows) + 0.5)
         )
+        g = math.isqrt(att.shape[-1])  # square token grid (7x7 for the VGG encoder)
         for r, i in enumerate(rows):
-            img = np.asarray(imgs[i])
+            img = np.asarray(imgs[i])[5:59, 5:59]  # the center 54x54 crop the model saw
             axes[r, 0].imshow(img)
             tag = "correct" if i in ok else "error"
             axes[r, 0].set_title(f"{tag}: true {preds[i]['target']} / pred {preds[i]['pred'] or '-'}",
@@ -424,9 +439,9 @@ def fig_task3(runs: dict, svhn_dir: Path, figs: Path) -> None:
                 ax = axes[r, k + 1]
                 ax.imshow(img)
                 if k <= len(preds[i]["pred"]):
-                    heat = att[i, k].reshape(2, 32)
-                    heat = np.kron(heat, np.ones((32, 8)))
-                    ax.imshow(heat, cmap="magma", alpha=0.55, extent=(0, 256, 64, 0))
+                    heat = att[i, k].reshape(g, g)
+                    ax.imshow(heat, cmap="magma", alpha=0.55, extent=(0, 54, 54, 0),
+                              interpolation="bilinear")  # fmt: skip
                     ch = preds[i]["pred"][k] if k < len(preds[i]["pred"]) else "EOS"
                     ax.set_title(f"step {k + 1}: {ch}", fontsize=7, color=INK2)
             for ax in axes[r]:
@@ -477,6 +492,38 @@ def fig_task3(runs: dict, svhn_dir: Path, figs: Path) -> None:
     save(fig, figs / "task3_length_errors")
 
 
+def fig_task3_protocols(root: Path, figs: Path) -> None:
+    """Exact-string accuracy per decoding/protocol mode, mean and sd over seeds."""
+    f = root / "task3_metrics_by_seed.csv"
+    if not f.exists():
+        return
+    df = pd.read_csv(f)
+    modes = [m for m in OCR_MODES if m != "val" and m in set(df.split)]
+    names = {
+        "test": "GT crop, greedy",
+        "test_length_constrained": "GT crop, length-constrained",
+        "test_beam3": "GT crop, beam 3",
+        "test_whole": "Whole image (stress)",
+    }
+    models = [m for m in ORDER[3] if m in set(df.model)]
+    fig, ax = plt.subplots(figsize=(10, 3.4))
+    width = 0.8 / max(1, len(models))
+    for j, m in enumerate(models):
+        g = df[(df.model == m) & df.split.isin(modes)].groupby("split").exact_match
+        mu = g.mean().reindex(modes)
+        sd = g.std(ddof=1).reindex(modes).fillna(0)
+        x = np.arange(len(modes)) + (j - (len(models) - 1) / 2) * width
+        ax.bar(x, mu.values * 100, width * 0.92, yerr=sd.values * 100, color=COLORS[m],
+               label=LABELS[m], capsize=2, edgecolor="white", linewidth=1)  # fmt: skip
+    ax.set_xticks(np.arange(len(modes)), [names[m] for m in modes])
+    ax.set_ylabel("exact-string accuracy (%)")
+    ax.set_title("Task 3 test accuracy by protocol and decoding (mean ± sd over 3 seeds)",
+                 fontsize=9, loc="left")  # fmt: skip
+    ax.legend(frameon=False, fontsize=7, ncol=2)
+    style_axes(ax)
+    save(fig, figs / "task3_protocols")
+
+
 def fig_tradeoff(root: Path, figs: Path) -> None:
     pts = []
     for task, key, lab in ((1, "RMSE", "test RMSE (kW)"), (2, "RMSE", "test pooled RMSE (kW)"),
@@ -484,6 +531,8 @@ def fig_tradeoff(root: Path, figs: Path) -> None:
         f = root / f"task{task}_metrics_summary.csv"
         if f.exists():
             df = pd.read_csv(f)
+            if "split" in df:
+                df = df[df.split == "test"]
             df = df[df.n_params_mean > 0]
             pts.append((task, key, lab, df))
     if not pts:
@@ -507,6 +556,7 @@ def fig_tradeoff(root: Path, figs: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default="configs/phase1.yaml")
+    ap.add_argument("--config3", default="configs/phase1_task3.yaml")
     ap.add_argument("--reps", type=int, default=10_000)
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text())
@@ -530,7 +580,9 @@ def main() -> None:
         fig_ts_forecasts(runs[t], t, figs)
         fig_ts_attention(runs[t], t, figs)
     fig_task2_horizon(root, figs)
-    fig_task3(runs[3], Path(cfg["svhn_dir"]), figs)
+    cfg3 = yaml.safe_load(Path(a.config3).read_text()) if Path(a.config3).exists() else cfg
+    fig_task3(runs[3], Path(cfg3.get("svhn_dir", "data/processed/svhn")), figs)
+    fig_task3_protocols(root, figs)
     fig_tradeoff(root, figs)
     index = [{"file": str(p), "task": p.stem.split("_")[0]} for p in sorted(figs.glob("*.png"))]
     write_json(index, figs / "figure_index.json")

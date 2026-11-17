@@ -102,21 +102,45 @@ def letterbox_images(
     width: int,
     pad: Sequence[int],
     crops: np.ndarray | None = None,
+    *,
+    stretch: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Images (N, H, W, 3) uint8 and geometry (N, 5) [src_w, src_h, scale, x_off, y_off].
 
-    Each image is optionally cropped to [left, top, right, bottom], resized with its aspect
-    ratio kept so it fits inside (height, width), and centered on a canvas filled with pad.
+    Each image is optionally cropped to [left, top, right, bottom] (clamped to the image,
+    see `clamp_box`). By default it is then resized with its aspect ratio kept so it fits
+    inside (height, width) and centered on a canvas filled with pad. With stretch=True it is
+    resized to exactly (width, height), the offsets are 0 and scale is width / src_w.
     """
     pad3 = [int(v) for v in pad]
     c = None if crops is None else np.ascontiguousarray(crops, dtype=np.float32)
     if _rs is None:
-        return letterbox_images_ref(paths, height, width, pad3, c)
-    return _rs.letterbox_images([str(p) for p in paths], height, width, pad3, c)
+        return letterbox_images_ref(paths, height, width, pad3, c, stretch=stretch)
+    return _rs.letterbox_images([str(p) for p in paths], height, width, pad3, c, stretch=stretch)
+
+
+def clamp_box(box: Sequence[float], w: int, h: int) -> tuple[int, int, int, int]:
+    """Integer crop [left, top, right, bottom] inside a w x h image, at least 1 pixel wide.
+
+    Same rule as the Rust code. The float box is floored/ceiled outward, then clamped.
+    The float32 cast matches the precision the Rust extension receives.
+    """
+    left, top, right, bottom = (float(np.float32(v)) for v in box)
+    li = int(np.clip(np.floor(left), 0, w - 1))
+    ti = int(np.clip(np.floor(top), 0, h - 1))
+    ri = int(np.clip(np.ceil(right), li + 1, w))
+    bi = int(np.clip(np.ceil(bottom), ti + 1, h))
+    return li, ti, ri, bi
 
 
 def letterbox_images_ref(
-    paths: Sequence[str], height: int, width: int, pad: list[int], crops: np.ndarray | None
+    paths: Sequence[str],
+    height: int,
+    width: int,
+    pad: list[int],
+    crops: np.ndarray | None,
+    *,
+    stretch: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     from PIL import Image
 
@@ -125,14 +149,12 @@ def letterbox_images_ref(
     for i, p in enumerate(paths):
         im = Image.open(p).convert("RGB")
         if crops is not None:
-            w0, h0 = im.size
-            left, top, right, bottom = crops[i]
-            left = int(np.clip(np.floor(left), 0, w0 - 1))
-            top = int(np.clip(np.floor(top), 0, h0 - 1))
-            right = int(np.clip(np.ceil(right), left + 1, w0))
-            bottom = int(np.clip(np.ceil(bottom), top + 1, h0))
-            im = im.crop((left, top, right, bottom))
+            im = im.crop(clamp_box(crops[i], *im.size))
         w, h = im.size
+        if stretch:
+            imgs[i] = np.asarray(im.resize((width, height), Image.Resampling.BILINEAR))
+            geom[i] = (w, h, np.float32(width) / np.float32(w), 0, 0)
+            continue
         scale = min(height / h, width / w)
         nw = int(np.clip(round(w * scale), 1, width))
         nh = int(np.clip(round(h * scale), 1, height))

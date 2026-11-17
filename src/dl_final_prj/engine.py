@@ -181,6 +181,36 @@ def fit(
     return model, history
 
 
+def prepare_run_dir(run_dir: Path, fingerprint: dict, force: bool) -> None:
+    """Guard against resuming a checkpoint made with other data or settings.
+
+    With force the run directory is wiped, so the run really restarts. Otherwise an
+    existing run_dir/fingerprint.json must equal `fingerprint` (config, model and data
+    identity), else a ValueError asks for --force instead of silently reusing ckpt.pt.
+    """
+    import shutil
+
+    fp_path = run_dir / "fingerprint.json"
+    if force and run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    current = json.loads(json.dumps(fingerprint, default=str, sort_keys=True))
+    if fp_path.exists():
+        saved = json.loads(fp_path.read_text())
+        if saved != current:
+            raise ValueError(
+                f"{run_dir} was started with different settings or data, rerun with --force"
+            )
+    elif (run_dir / "ckpt.pt").exists():
+        raise ValueError(f"{run_dir} has a checkpoint without a fingerprint, rerun with --force")
+    write_json(current, fp_path)
+
+
+def file_identity(path: Path) -> dict:
+    st = path.stat()
+    return {"path": str(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
 def pick_device() -> str:
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True

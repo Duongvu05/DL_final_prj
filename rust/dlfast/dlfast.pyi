@@ -10,6 +10,8 @@ def letterbox_images(
     width: int,
     pad: list[int],
     crops: NDArray[np.float32] | None = None,
+    *,
+    stretch: bool = False,
 ) -> tuple[NDArray[np.uint8], NDArray[np.float32]]: ...
 def mean_rgb(paths: list[str]) -> list[float]: ...
 def block_bootstrap_means(

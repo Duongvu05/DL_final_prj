@@ -76,6 +76,36 @@ def test_letterbox_rust_matches_pillow(tmp_path):
     np.testing.assert_allclose(fast.mean_rgb(paths), fast.mean_rgb_ref(paths))
 
 
+def test_letterbox_stretch_rust_matches_pillow(tmp_path):
+    from PIL import Image
+
+    rng = np.random.default_rng(1)
+    paths = []
+    for i, (w, h) in enumerate([(100, 40), (30, 80), (64, 64), (21, 9)]):
+        arr = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+        arr = np.kron(arr[::6, ::6], np.ones((6, 6, 1), np.uint8))[:h, :w]
+        p = tmp_path / f"{i}.png"
+        Image.fromarray(arr).save(p)
+        paths.append(str(p))
+    # inside, partly outside (clamped), the whole image, and a fractional box
+    crops = np.array(
+        [[10, 5, 90, 35], [-12.5, 30, 41, 95], [0, 0, 64, 64], [2.4, 1.6, 15.2, 8.7]], np.float32
+    )
+    for c in (None, crops):
+        im, g = fast.letterbox_images(paths, 64, 64, (1, 2, 3), c, stretch=True)
+        rim, rg = fast.letterbox_images_ref(paths, 64, 64, [1, 2, 3], c, stretch=True)
+        np.testing.assert_array_equal(g, rg)  # geometry is exact
+        assert im.shape == (4, 64, 64, 3) and im.dtype == np.uint8
+        assert np.all(g[:, 3:] == 0)
+        np.testing.assert_allclose(g[:, 2], 64 / g[:, 0], rtol=1e-6)
+        assert np.abs(im.astype(int) - rim.astype(int)).mean() < 12
+    _, g = fast.letterbox_images(paths, 64, 64, (0, 0, 0), crops, stretch=True)
+    np.testing.assert_array_equal(g[:, :2], [[80, 30], [30, 50], [64, 64], [14, 8]])
+    for (w, h), box, (sw, sh) in zip([(100, 40), (30, 80), (64, 64), (21, 9)], crops, g[:, :2]):
+        left, top, right, bottom = fast.clamp_box(box, w, h)
+        assert (right - left, bottom - top) == (sw, sh)
+
+
 def test_dm_test_detects_better_model():
     rng = np.random.default_rng(0)
     e = rng.normal(size=3000)

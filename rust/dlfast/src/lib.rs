@@ -90,6 +90,7 @@ fn letterbox_one(
     height: u32,
     width: u32,
     pad: [u8; 3],
+    stretch: bool,
     out: &mut [u8],
 ) -> Result<Geometry, String> {
     let img = image::open(path).map_err(|e| format!("{path}: {e}"))?.to_rgb8();
@@ -105,6 +106,12 @@ fn letterbox_one(
         None => img,
     };
     let (w, h) = img.dimensions();
+    if stretch {
+        // Fill the whole canvas, ignoring the aspect ratio. Scale is the horizontal factor.
+        let resized = image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle);
+        out.copy_from_slice(resized.as_raw());
+        return Ok(Geometry { orig_w: w as f32, orig_h: h as f32, scale: width as f32 / w as f32, x_off: 0.0, y_off: 0.0 });
+    }
     let scale = (height as f32 / h as f32).min(width as f32 / w as f32);
     let nw = ((w as f32 * scale).round() as u32).clamp(1, width);
     let nh = ((h as f32 * scale).round() as u32).clamp(1, height);
@@ -126,9 +133,10 @@ fn letterbox_one(
 /// Decode, optionally crop, resize with preserved aspect ratio, and center-pad each image
 /// into a (height, width, 3) uint8 canvas. Returns images (N, H, W, 3) and geometry
 /// (N, 5) with columns [source_w, source_h, scale, x_offset, y_offset], where source is
-/// the image after the optional crop.
+/// the image after the optional crop. With `stretch`, the source is resized to exactly
+/// (width, height) ignoring its aspect ratio, so the offsets are 0 and scale is width/source_w.
 #[pyfunction]
-#[pyo3(signature = (paths, height, width, pad, crops=None))]
+#[pyo3(signature = (paths, height, width, pad, crops=None, *, stretch=false))]
 fn letterbox_images<'py>(
     py: Python<'py>,
     paths: Vec<String>,
@@ -136,6 +144,7 @@ fn letterbox_images<'py>(
     width: u32,
     pad: [u8; 3],
     crops: Option<PyReadonlyArray2<'py, f32>>,
+    stretch: bool,
 ) -> PyResult<(Bound<'py, PyArray4<u8>>, Bound<'py, PyArray2<f32>>)> {
     let n = paths.len();
     let crops: Option<Vec<[f32; 4]>> = match crops {
@@ -154,7 +163,9 @@ fn letterbox_images<'py>(
         let geoms: Vec<Result<Geometry, String>> = buf
             .par_chunks_mut(per)
             .enumerate()
-            .map(|(i, out)| letterbox_one(&paths[i], crops.as_ref().map(|c| c[i]), height, width, pad, out))
+            .map(|(i, out)| {
+                letterbox_one(&paths[i], crops.as_ref().map(|c| c[i]), height, width, pad, stretch, out)
+            })
             .collect();
         let mut g = Vec::with_capacity(n * 5);
         for r in geoms {
@@ -384,6 +395,20 @@ mod tests {
         assert_eq!(parse_decimal_comma("2,5").unwrap(), 2.5);
         assert_eq!(parse_decimal_comma("0").unwrap(), 0.0);
         assert!(parse_decimal_comma("\"\"").unwrap().is_nan());
+    }
+
+    #[test]
+    fn letterbox_stretch_fills_canvas() {
+        let path = std::env::temp_dir().join(format!("dlfast_stretch_{}.png", std::process::id()));
+        let img = image::RgbImage::from_fn(20, 10, |x, y| image::Rgb([(x * 10) as u8, (y * 20) as u8, 7]));
+        img.save(&path).unwrap();
+        let mut out = vec![0u8; 8 * 6 * 3];
+        let p = path.to_str().unwrap();
+        let g = letterbox_one(p, Some([2.0, 1.0, 12.0, 9.0]), 8, 6, [1, 2, 3], true, &mut out).unwrap();
+        assert_eq!((g.orig_w, g.orig_h, g.x_off, g.y_off), (10.0, 8.0, 0.0, 0.0));
+        assert!((g.scale - 0.6).abs() < 1e-6);
+        assert!(out.chunks_exact(3).all(|px| px[2] == 7)); // no padding pixel anywhere
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

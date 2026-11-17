@@ -6,55 +6,38 @@ svhn_dir: data/processed/svhn
 
 task1:
   title: "Two-hour-ahead forecasting of MT_235 electricity load"
+  # Target-only seasonal-residual design (plan 1.1, 2.1). Inputs: y, y(s-24), y(s-48),
+  # y(s-168) and calendar per step. Output: standardized r = y(t+2) - y(t+2-24).
   lookback: 168
   offsets: [2]
+  target_only: true
   batch_size: 256
   eval_batch_size: 2048
-  fit: {epochs: 50, patience: 8, lr: 1.0e-3, weight_decay: 1.0e-4, clip: 1.0, plateau_patience: 3, plateau_factor: 0.5}
+  fit: {epochs: 50, patience: 8, lr: 5.0e-4, weight_decay: 1.0e-4, clip: 1.0, schedule: plateau, plateau_patience: 3, plateau_factor: 0.5}
   models:
-    bigru_attention:   # course-main Attentive BiGRU-2
+    bigru_attention:   # course-main seasonal-residual Attentive BiGRU-2
       kind: birnn
-      args: {hidden: 128, layers: 2, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128, cell: gru}
-    bigru:             # same model without temporal attention (T1-A1)
+      args: {hidden: 64, layers: 2, dropout: 0.2, attention: true, attn_dim: 128, head_dim: 128, cell: gru}
+    bigru:             # same residual BiGRU-2 without temporal attention
       kind: birnn
-      args: {hidden: 128, layers: 2, dropout: 0.2, attention: false, head_dim: 128, cell: gru}
+      args: {hidden: 64, layers: 2, dropout: 0.2, attention: false, head_dim: 128, cell: gru}
 
 task2:
   title: "Five-hour-ahead sequence forecasting of MT_235 electricity load"
+  # Same inputs as task1. The decoder predicts standardized r(t+h) for h = 1..5.
   lookback: 168
   offsets: [1, 2, 3, 4, 5]
+  target_only: true
   batch_size: 128
   eval_batch_size: 2048
-  fit: {epochs: 60, patience: 10, lr: 5.0e-4, weight_decay: 1.0e-4, clip: 1.0, plateau_patience: 3, plateau_factor: 0.5}
-  teacher_forcing: {start: 0.7, end: 0.3, decay_epochs: 25}
+  fit: {epochs: 60, patience: 10, lr: 5.0e-4, weight_decay: 1.0e-4, clip: 1.0, schedule: plateau, plateau_patience: 3, plateau_factor: 0.5}
+  teacher_forcing: {start: 1.0, end: 1.0, decay_epochs: 1}
   models:
-    seq2seq_attention:  # course-main attentive LSTM encoder-decoder
+    seq2seq_attention:  # course-main seasonal-residual attentive LSTM encoder-decoder
       kind: seq2seq
-      args: {hidden: 128, enc_layers: 2, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
-    seq2seq:            # same without decoder attention (T2-A1)
+      args: {hidden: 64, enc_layers: 2, dropout: 0.2, attention: true, attn_dim: 128, horizon_dim: 16}
+    seq2seq:            # same residual encoder-decoder without decoder attention
       kind: seq2seq
-      args: {hidden: 128, enc_layers: 2, dropout: 0.2, attention: false, horizon_dim: 16}
+      args: {hidden: 64, enc_layers: 2, dropout: 0.2, attention: false, horizon_dim: 16}
 
-task3:
-  title: "Full house-number recognition from SVHN street-view images"
-  height: 64
-  width: 256
-  max_len: 6
-  batch_size: 128
-  eval_batch_size: 512
-  fit: {epochs: 40, patience: 7, lr: 3.0e-4, weight_decay: 1.0e-4, clip: 1.0, plateau_patience: 3, plateau_factor: 0.5, amp: bf16}
-  cnn_lr_mult: 0.1
-  freeze_stem_epochs: 3
-  label_smoothing: 0.05
-  teacher_forcing: {hold_epochs: 5, start: 1.0, end: 0.5, end_epoch: 30}
-  augment: {max_shift: 0.06, scale: [0.9, 1.1], max_rotation: 5.0, brightness: 0.2, contrast: 0.2}
-  models:
-    cnn_attention_lstm:  # course-main CNN + spatial-attention 2-layer LSTM decoder
-      kind: attention
-      args: {hidden: 256, layers: 2, attn_dim: 256, dropout: 0.2, pretrained: true}
-    cnn_pool_lstm:       # global-average-pooling CNN + 1-layer LSTM, no attention (T3-A1)
-      kind: pooled
-      args: {hidden: 256, layers: 1, dropout: 0.2, pretrained: true}
-    crnn_ctc:            # CRNN: height-collapsed CNN + BiLSTM + CTC (T3-A2)
-      kind: ctc
-      args: {hidden: 256, layers: 2, dropout: 0.2, pretrained: true}
+# Task 3 settings live in configs/phase1_task3.yaml.

@@ -2,6 +2,8 @@
 
 Writes data/processed/{electricity_hourly.npz, electricity_audit.json, svhn/*} and
 results/manifests/{dataset_manifest.json, split_manifest.json, environment.json, checksums.txt}.
+The SVHN cache follows the cropped protocol of configs/phase1_task3.yaml (raw train, extra and
+test folders under data/raw/svhn).
 """
 
 import argparse
@@ -42,9 +44,12 @@ def main() -> None:
     ap.add_argument("--raw", default="data/raw")
     ap.add_argument("--processed", default="data/processed")
     ap.add_argument("--config", default="configs/phase1.yaml")
+    ap.add_argument("--task3-config", default="configs/phase1_task3.yaml")
+    ap.add_argument("--workers", type=int, default=None, help="digitStruct.mat parse processes")
     ap.add_argument("--skip", choices=("electricity", "svhn"), action="append", default=[])
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text())
+    t3 = yaml.safe_load(Path(a.task3_config).read_text())
     raw, proc = Path(a.raw), Path(a.processed)
     man = Path(cfg["results_root"]) / "manifests"
     man.mkdir(parents=True, exist_ok=True)
@@ -58,24 +63,40 @@ def main() -> None:
     if "svhn" not in a.skip:
         t0 = time.time()
         audit = svhn.prepare(
-            raw / "svhn", proc / "svhn", cfg["task3"]["height"], cfg["task3"]["width"]
+            raw / "svhn",
+            proc / "svhn",
+            size=t3["size"],
+            max_len=t3["max_len"],
+            val_frac=t3.get("val_frac", 0.1),
+            workers=a.workers,
         )
-        logger.info(f"svhn cached in {time.time() - t0:.1f}s: {audit['splits']}")
+        counts = {k: v["n_images"] for k, v in audit["splits"].items()}
+        logger.info(f"svhn cached in {time.time() - t0:.1f}s: {counts}")
 
     e_audit = json.loads((proc / "electricity_audit.json").read_text())
     s_audit = json.loads((proc / "svhn" / "svhn_audit.json").read_text())
     write_json({"electricity": e_audit, "svhn": s_audit}, man / "dataset_manifest.json")
 
-    splits = {"task3": {k: v for k, v in s_audit["splits"].items()}}
+    splits = {
+        "task3": {
+            "rule": s_audit["split_rule"],
+            "counts_per_source": s_audit["counts_per_source"],
+            "dropped_long_labels": s_audit["dropped_long_labels"]["count"],
+            "pool_size_before_split": s_audit["pool_size_before_split"],
+            "n_images": {k: v["n_images"] for k, v in s_audit["splits"].items()},
+            "splits": s_audit["splits"],
+        }
+    }
     npz = proc / "electricity_hourly.npz"
     for t in (1, 2):
         tc = cfg[f"task{t}"]
         d = ElectricityData(npz, tc["lookback"], tuple(tc["offsets"]))
-        n_all = d.n - tc["lookback"] - max(tc["offsets"]) + 1
+        rule = d.window_rule()
         splits[f"task{t}"] = {
             "lookback": tc["lookback"],
             "offsets": tc["offsets"],
-            "formula_all_windows": f"N - L - {max(tc['offsets'])} + 1 = {d.n} - {tc['lookback']} - {max(tc['offsets'])} + 1 = {n_all}",
+            "formula_all_windows": rule["formula_all_windows"],
+            "n_all_windows": rule["n_all_windows"],
             "rule": "origin assigned to the split containing all its target hours, inputs may cross the boundary",
             "splits": d.split_summary(),
         }

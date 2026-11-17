@@ -1,6 +1,8 @@
-"""Recurrent forecasters for Task 1 (Attentive BiGRU-2) and Task 2 (attentive LSTM seq2seq).
+"""Seasonal-residual recurrent forecasters for Task 1 (BiGRU-2) and Task 2 (LSTM seq2seq).
 
-Every model maps an electricity Batch to (pred (B, H) in scaled units, aux dict).
+Every model maps an electricity Batch to (pred (B, H) standardized residuals, aux dict). The
+kW forecast is ElectricityData.inverse(pred, origins), i.e. y(tau-24) plus the unscaled
+residual (plan Sections 2.1 and 2.2).
 """
 
 import torch
@@ -33,17 +35,20 @@ class AdditiveAttention(nn.Module):
 
 
 class BiRNNForecaster(nn.Module):
-    """Task 1. Two-layer bidirectional GRU over the 168-hour window, optional temporal attention.
+    """Task 1. Seasonal-residual (attentive) BiGRU-2 over the 168-hour target-only window.
 
-    The query of the attention is the concatenated last-layer final forward and backward
-    states. Head is LayerNorm -> Linear -> GELU -> Dropout -> Linear(1).
+    The final state is the concat of the last-layer forward and backward final states. With
+    attention, a Bahdanau MLP scores all encoder outputs with the final state as query. The
+    head sees [final, context (if attention), target features of every horizon flattened] and
+    is LayerNorm -> Linear(head_dim) -> GELU -> Dropout -> Linear(H) standardized residuals.
     """
 
     def __init__(
         self,
         n_features: int,
         horizon: int = 1,
-        hidden: int = 128,
+        n_target_feats: int = 10,
+        hidden: int = 64,
         layers: int = 2,
         dropout: float = 0.2,
         attention: bool = True,
@@ -59,7 +64,7 @@ class BiRNNForecaster(nn.Module):
         self.cell = cell
         state_dim = 2 * hidden
         self.attn = AdditiveAttention(state_dim, state_dim, attn_dim) if attention else None
-        feat = state_dim * (2 if attention else 1)
+        feat = state_dim * (2 if attention else 1) + horizon * n_target_feats
         self.head = nn.Sequential(
             nn.LayerNorm(feat),
             nn.Linear(feat, head_dim),
@@ -73,42 +78,47 @@ class BiRNNForecaster(nn.Module):
         h_n = h[0] if self.cell == "lstm" else h
         final = torch.cat([h_n[-2], h_n[-1]], dim=-1)
         aux = {}
-        feat = final
+        parts = [final]
         if self.attn is not None:
             ctx, w = self.attn(final, out)
-            feat = torch.cat([final, ctx], dim=-1)
+            parts.append(ctx)
             aux["attention"] = w
-        return self.head(feat), aux
+        parts.append(b.target_feats.flatten(1))
+        return self.head(torch.cat(parts, dim=-1)), aux
 
 
 class Seq2SeqForecaster(nn.Module):
-    """Task 2. LSTM encoder (2 layers) and autoregressive 1-layer LSTM decoder.
+    """Task 2. Two-layer LSTM encoder and autoregressive LSTMCell residual decoder.
 
-    Decoder input at step k is [previous target, calendar of target hour k, horizon
-    embedding k, attention context]. The attention query is the decoder state before the
-    update (Bahdanau). The first previous target is the last observed target value. The
-    decoder starts from the encoder's top-layer final (h, c).
+    The decoder starts from the encoder's top-layer final (h, c). Its input at step k is
+    [previous standardized residual, target features of hour t+k (10), learned horizon
+    embedding k, attention context (if attention)]. The attention query is the decoder state
+    before the update (Bahdanau). The first previous residual is r(t) at the origin. The output
+    Linear([h, context]) gives one standardized residual per step.
+
+    In training mode the previous residual is the true one from Batch.y with probability
+    `teacher_forcing` (1.0 in Phase 1). In eval mode decoding is fully autoregressive whatever
+    the ratio argument.
     """
 
     def __init__(
         self,
         n_features: int,
-        target_col: int,
         horizon: int = 5,
-        hidden: int = 128,
+        n_target_feats: int = 10,
+        hidden: int = 64,
         enc_layers: int = 2,
         dropout: float = 0.2,
         attention: bool = True,
         attn_dim: int = 128,
         horizon_dim: int = 16,
-        n_calendar: int = 4,
     ) -> None:
         super().__init__()
-        self.target_col, self.horizon = target_col, horizon
+        self.horizon = horizon
         self.encoder = nn.LSTM(n_features, hidden, enc_layers, batch_first=True, dropout=dropout)
         self.attn = AdditiveAttention(hidden, hidden, attn_dim) if attention else None
         self.h_emb = nn.Embedding(horizon, horizon_dim)
-        dec_in = 1 + n_calendar + horizon_dim + (hidden if attention else 0)
+        dec_in = 1 + n_target_feats + horizon_dim + (hidden if attention else 0)
         self.decoder = nn.LSTMCell(dec_in, hidden)
         self.drop = nn.Dropout(dropout)
         self.out = nn.Linear(hidden * (2 if attention else 1), 1)
@@ -117,12 +127,13 @@ class Seq2SeqForecaster(nn.Module):
         enc, (h_n, c_n) = self.encoder(b.x)
         h, c = h_n[-1], c_n[-1]
         kp = self.attn.w_k(enc) if self.attn is not None else None
-        prev = b.x[:, -1, self.target_col].unsqueeze(-1)
+        prev = b.r0.unsqueeze(-1)
         preds, weights = [], []
         bsz = b.x.shape[0]
+        tf = teacher_forcing if self.training else 0.0
         for k in range(self.horizon):
             emb = self.h_emb.weight[k].expand(bsz, -1)
-            parts = [prev, b.cal_future[:, k], emb]
+            parts = [prev, b.target_feats[:, k], emb]
             ctx = None
             if self.attn is not None:
                 ctx, w = self.attn(h, enc, kp)
@@ -132,10 +143,14 @@ class Seq2SeqForecaster(nn.Module):
             feat = self.drop(h if ctx is None else torch.cat([h, ctx], dim=-1))
             pred = self.out(feat)
             preds.append(pred)
-            prev = pred
-            if teacher_forcing > 0 and self.training:
-                use = torch.rand(bsz, 1, device=pred.device) < teacher_forcing
-                prev = torch.where(use, b.y[:, k : k + 1], pred)
+            true = b.y[:, k : k + 1]
+            if tf >= 1.0:
+                prev = true
+            elif tf > 0.0:
+                use = torch.rand(bsz, 1, device=pred.device) < tf
+                prev = torch.where(use, true, pred)
+            else:
+                prev = pred
         aux = {"attention": torch.stack(weights, dim=1)} if weights else {}
         return torch.cat(preds, dim=-1), aux
 

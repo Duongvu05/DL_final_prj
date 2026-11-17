@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Phase 1 queue for the A100 pod. Safe to rerun after a preemption: finished runs are
 # skipped and unfinished ones resume from their checkpoint.
-#   bash scripts/phase1.sh            # everything
-#   TS_JOBS=4 OCR_JOBS=2 bash scripts/phase1.sh
+#   bash scripts/phase1.sh                     # everything
+#   TS_JOBS=4 OCR_JOBS=3 bash scripts/phase1.sh
+#   ONLY=ts bash scripts/phase1.sh             # only Tasks 1-2 (ONLY=ocr for Task 3)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH=/home/data/.local/bin:/home/data/.cargo/bin:$PATH
@@ -12,13 +13,11 @@ export TORCH_HOME=${TORCH_HOME:-/home/data/.cache/torch}
 # directly. `uv run` would re-sync to uv.lock and download a different torch.
 PY=${PY:-.venv/bin/python}
 TS_JOBS=${TS_JOBS:-4}
-OCR_JOBS=${OCR_JOBS:-2}
+OCR_JOBS=${OCR_JOBS:-3}
+ONLY=${ONLY:-all}
 LOG=results/phase1/logs
 mkdir -p "$LOG"
-
-for t in 1 2; do
-  "$PY" scripts/run_baselines.py --task "$t" > "$LOG/baselines_task$t.log" 2>&1 || echo "baselines task$t failed"
-done
+export LOG PY
 
 ts_jobs() {
   for seed in 0 1 2; do
@@ -28,13 +27,20 @@ ts_jobs() {
 }
 ocr_jobs() {
   for seed in 0 1 2; do
-    for m in cnn_attention_lstm cnn_pool_lstm crnn_ctc; do echo "$m $seed"; done
+    for m in cnn_attention_gru cnn_pool_gru multihead_cnn crnn_ctc; do echo "$m $seed"; done
   done
 }
-export LOG PY
-ts_jobs | xargs -P "$TS_JOBS" -L 1 bash -c \
-  '$PY scripts/run_ts.py --task $0 --model $1 --seed $2 > $LOG/task$0_$1_seed$2.log 2>&1 || echo "FAILED task$0 $1 seed$2"' &
-ocr_jobs | xargs -P "$OCR_JOBS" -L 1 bash -c \
-  '$PY scripts/run_ocr.py --model $0 --seed $1 > $LOG/task3_$0_seed$1.log 2>&1 || echo "FAILED task3 $0 seed$1"' &
+
+if [ "$ONLY" != ocr ]; then
+  for t in 1 2; do
+    "$PY" scripts/run_baselines.py --task "$t" > "$LOG/baselines_task$t.log" 2>&1 || echo "FAILED baselines task$t"
+  done
+  ts_jobs | xargs -P "$TS_JOBS" -L 1 bash -c \
+    '$PY scripts/run_ts.py --task $0 --model $1 --seed $2 > $LOG/task$0_$1_seed$2.log 2>&1 || echo "FAILED task$0 $1 seed$2"' &
+fi
+if [ "$ONLY" != ts ]; then
+  ocr_jobs | xargs -P "$OCR_JOBS" -L 1 bash -c \
+    '$PY scripts/run_ocr.py --model $0 --seed $1 > $LOG/task3_$0_seed$1.log 2>&1 || echo "FAILED task3 $0 seed$1"' &
+fi
 wait
 echo "PHASE1_QUEUE_DONE $(date)"

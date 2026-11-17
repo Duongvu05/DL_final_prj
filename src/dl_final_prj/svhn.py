@@ -1,51 +1,69 @@
-"""SVHN Format 1 full numbers for Task 3 (plan Sections 1.2 and 4.1).
+"""SVHN Format 1 full numbers for Task 3, cropped protocol (plan Sections 1.2, 2.3 and 4.1).
 
-prepare() parses digitStruct.mat, makes the fixed hash-based 90/10 train/validation split
-stratified by sequence length, and letterboxes every image once into a uint8 cache with the
-Rust extension. Training then reads only the cache, so no image is decoded during training.
+prepare() parses digitStruct.mat of train, extra and test, drops train/extra numbers longer
+than MAX_LEN, merges train+extra and makes the fixed hash-based 90/10 train/validation split
+stratified by length. Every image is cropped once to its expanded ground-truth union box and
+resized to 64x64 (aspect ratio ignored) into a uint8 cache with the Rust extension. The whole
+test images are also letterboxed into 64x64 as a stress-test cache. Training then reads only
+the cache, so no image is decoded during training.
 """
 
 import hashlib
 import json
+import math
+import os
+import time
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812
+from loguru import logger
 
-from dl_final_prj.fast import letterbox_images, mean_rgb
+from dl_final_prj.fast import letterbox_images
 
 PAD, SOS, EOS = 0, 1, 2
 DIGIT0 = 3
 VOCAB = DIGIT0 + 10
+MAX_LEN = 5
 URL = "https://ufldl.stanford.edu/housenumbers/"
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+NORM_MEAN = (0.5, 0.5, 0.5)
+NORM_STD = (0.5, 0.5, 0.5)
+CROP_EXPAND = 1.3
+SOURCES = ("train", "extra", "test")
+_BOX_KEYS = ("label", "left", "top", "width", "height")
 
 
-def parse_digit_struct(mat_path: Path) -> list[dict]:
-    """[{name, label (str, left to right), boxes [[left, top, width, height], ...]}] in file order."""
+# --- digitStruct.mat ----------------------------------------------------------------
+
+
+def _read_values(f: Any, ds: Any) -> list[float]:
+    """One bbox field. Single-digit images store the value, others store object references."""
+    import h5py
+
+    arr = ds[()]
+    if h5py.check_dtype(ref=ds.dtype) is not None:
+        return [float(f[r][()].item()) for r in np.ravel(arr)]
+    return [float(v) for v in np.ravel(arr)]
+
+
+def _parse_range(mat_path: str, start: int, stop: int) -> list[dict]:
+    """Records start..stop-1 of one digitStruct.mat. Top-level so worker processes can run it."""
     import h5py
 
     out = []
     with h5py.File(mat_path, "r") as handle:
         f: Any = handle  # h5py objects are untyped
-        bbox, names = f["digitStruct/bbox"], f["digitStruct/name"]
-
-        def field(group, key: str) -> list[float]:
-            ds = group[key]
-            if ds.shape[0] == 1:
-                return [float(ds[()].item())]
-            return [float(f[ds[j][0]][()].item()) for j in range(ds.shape[0])]
-
-        for i in range(len(names)):
-            name = "".join(chr(int(c[0])) for c in f[names[i][0]][()])
-            g = f[bbox[i][0]]
-            lab = field(g, "label")
-            left, top = field(g, "left"), field(g, "top")
-            width, height = field(g, "width"), field(g, "height")
+        name_refs = f["digitStruct/name"][start:stop, 0]  # one read for the whole range
+        bbox_refs = f["digitStruct/bbox"][start:stop, 0]
+        for nref, bref in zip(name_refs, bbox_refs, strict=True):
+            name = np.ravel(f[nref][()]).astype(np.uint8).tobytes().decode("ascii")
+            g = f[bref]
+            lab, left, top, width, height = (_read_values(f, g[k]) for k in _BOX_KEYS)
             order = np.argsort(left, kind="stable")
             digits = "".join(str(int(lab[k]) % 10) for k in order)  # MATLAB label 10 is digit 0
             boxes = [[left[k], top[k], width[k], height[k]] for k in order]
@@ -53,23 +71,83 @@ def parse_digit_struct(mat_path: Path) -> list[dict]:
     return out
 
 
+def parse_digit_struct(
+    mat_path: Path, workers: int | None = None, chunk: int | None = None
+) -> list[dict]:
+    """[{name, label (str, left to right), boxes [[left, top, width, height], ...]}] in file order.
+
+    Large files (extra has 202,353 images) are parsed by `workers` processes over index
+    chunks. workers=None uses up to 16 processes for files with more than 4,000 images.
+    """
+    import h5py
+
+    with h5py.File(mat_path, "r") as handle:
+        f: Any = handle
+        n = int(f["digitStruct/name"].shape[0])
+    if workers is None:
+        workers = min(16, os.cpu_count() or 1) if n > 4000 else 1
+    if workers <= 1:
+        return _parse_range(str(mat_path), 0, n)
+    chunk = chunk or max(1, math.ceil(n / (workers * 8)))
+    ranges = [(s, min(n, s + chunk)) for s in range(0, n, chunk)]
+    parts: dict[int, list[dict]] = {}
+    t0, done = time.time(), 0
+    # spawn, not fork: the parent may hold torch threads, and h5py handles must not be shared
+    with ProcessPoolExecutor(workers, mp_context=get_context("spawn")) as ex:
+        futs = {ex.submit(_parse_range, str(mat_path), s, e): s for s, e in ranges}
+        for fut in as_completed(futs):
+            parts[futs[fut]] = fut.result()
+            done += len(parts[futs[fut]])
+            if len(parts) % max(1, len(ranges) // 10) == 0 or done == n:
+                logger.info(f"{mat_path.parent.name}: parsed {done}/{n} ({time.time() - t0:.0f}s)")
+    return [r for s, _ in ranges for r in parts[s]]
+
+
+# --- split and crop rules -----------------------------------------------------------
+
+
+def record_key(r: dict) -> str:
+    """Unique image id. Names repeat across folders (train/1.png and extra/1.png)."""
+    return f"{r['dir']}/{r['name']}" if "dir" in r else r["name"]
+
+
 def hash_split(
     records: list[dict], val_frac: float = 0.1, salt: str = "group12"
 ) -> tuple[list[int], list[int]]:
     """Deterministic split stratified by length. Within each length, the val_frac of images
-    with the smallest sha1(salt + name) go to validation."""
+    with the smallest sha1(salt + dir/name) go to validation."""
     by_len: dict[int, list[int]] = {}
     for i, r in enumerate(records):
         by_len.setdefault(len(r["label"]), []).append(i)
     train, val = [], []
     for idx in by_len.values():
         idx = sorted(
-            idx, key=lambda i: hashlib.sha1((salt + records[i]["name"]).encode()).hexdigest()
+            idx, key=lambda i: hashlib.sha1((salt + record_key(records[i])).encode()).hexdigest()
         )
         k = int(len(idx) * val_frac)
         val += idx[:k]
         train += idx[k:]
     return sorted(train), sorted(val)
+
+
+def drop_long(records: list[dict], max_len: int = MAX_LEN) -> tuple[list[dict], list[dict]]:
+    """(kept, dropped) where dropped have more than max_len digits."""
+    kept = [r for r in records if len(r["label"]) <= max_len]
+    return kept, [r for r in records if len(r["label"]) > max_len]
+
+
+def crop_box(boxes: Sequence[Sequence[float]], expand: float = CROP_EXPAND) -> list[float]:
+    """[left, top, right, bottom] of the square around the digit-box union, scaled by expand.
+
+    The union box is squared around its center with side max(width, height), then grown by
+    (expand - 1) / 2 * side on each side. Clamping to the image happens in the Rust crop.
+    """
+    b = np.asarray(boxes, np.float64)
+    left, top = b[:, 0].min(), b[:, 1].min()
+    right, bottom = (b[:, 0] + b[:, 2]).max(), (b[:, 1] + b[:, 3]).max()
+    cx, cy = (left + right) / 2, (top + bottom) / 2
+    half = max(float(right - left), float(bottom - top)) * expand / 2
+    return [float(cx - half), float(cy - half), float(cx + half), float(cy + half)]
 
 
 def length_hist(labels: list[str]) -> dict[str, int]:
@@ -79,67 +157,180 @@ def length_hist(labels: list[str]) -> dict[str, int]:
     return dict(sorted(h.items(), key=lambda kv: int(kv[0])))
 
 
-def prepare(raw_dir: Path, out_dir: Path, height: int = 64, width: int = 256) -> dict:
+# --- cache ------------------------------------------------------------------------
+
+
+def _write_cache(
+    path: Path,
+    paths: list[str],
+    size: int,
+    crops: np.ndarray | None,
+    stretch: bool,
+    pad: list[int],
+    chunk: int,
+) -> np.ndarray:
+    """Decode/resize in chunks straight into a .npy memmap. Returns geometry (N, 5)."""
+    n = len(paths)
+    arr = np.lib.format.open_memmap(path, mode="w+", dtype=np.uint8, shape=(n, size, size, 3))
+    geom = np.zeros((n, 5), np.float32)
+    t0 = time.time()
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        c = None if crops is None else crops[s:e]
+        imgs, g = letterbox_images(paths[s:e], size, size, pad, c, stretch=stretch)
+        arr[s:e], geom[s:e] = imgs, g
+        logger.info(f"{path.name}: {e}/{n} images ({time.time() - t0:.0f}s)")
+    arr.flush()
+    del arr
+    return geom
+
+
+def _channel_mean(path: Path, chunk: int = 20000) -> np.ndarray:
+    """Per-channel RGB mean of a cached (N, H, W, 3) uint8 array, in [0, 255]."""
+    arr = np.load(path, mmap_mode="r")
+    total = np.zeros(3)
+    for s in range(0, len(arr), chunk):
+        total += np.asarray(arr[s : s + chunk]).reshape(-1, 3).sum(0, dtype=np.float64)
+    return total / max(1, len(arr) * arr.shape[1] * arr.shape[2])
+
+
+def _labels_json(recs: list[dict], geom: np.ndarray) -> str:
+    return json.dumps(
+        [
+            {
+                "name": r["name"],
+                "dir": r["dir"],
+                "label": r["label"],
+                "boxes": r["boxes"],
+                "crop": [round(v, 3) for v in r["crop"]],
+                "geometry": [round(float(v), 5) for v in g],
+            }
+            for r, g in zip(recs, geom, strict=True)
+        ]
+    )
+
+
+def prepare(
+    raw_dir: Path,
+    out_dir: Path,
+    size: int = 64,
+    max_len: int = MAX_LEN,
+    val_frac: float = 0.1,
+    workers: int | None = None,
+    chunk: int = 20000,
+) -> dict:
+    """Build the cropped cache from raw_dir/{train,extra,test}. Returns the audit dict."""
+    raw_dir, out_dir = Path(raw_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_recs = parse_digit_struct(raw_dir / "train" / "digitStruct.mat")
-    test_recs = parse_digit_struct(raw_dir / "test" / "digitStruct.mat")
-    tr_idx, va_idx = hash_split(train_recs)
+    recs: dict[str, list[dict]] = {}
+    for src in SOURCES:
+        t0 = time.time()
+        recs[src] = parse_digit_struct(raw_dir / src / "digitStruct.mat", workers)
+        for r in recs[src]:
+            r["dir"] = src
+            r["crop"] = crop_box(r["boxes"])
+        logger.info(f"{src}: {len(recs[src])} images parsed in {time.time() - t0:.1f}s")
+
+    pool, dropped = [], []
+    for src in ("train", "extra"):
+        kept, drop = drop_long(recs[src], max_len)
+        pool += kept
+        dropped += drop
+    long_test = [record_key(r) for r in recs["test"] if len(r["label"]) > max_len]
+    if long_test:
+        raise ValueError(f"test labels longer than {max_len} digits: {long_test[:5]}")
+    tr_idx, va_idx = hash_split(pool, val_frac)
     splits = {
-        "train": [train_recs[i] | {"dir": "train"} for i in tr_idx],
-        "val": [train_recs[i] | {"dir": "train"} for i in va_idx],
-        "test": [r | {"dir": "test"} for r in test_recs],
+        "train": [pool[i] for i in tr_idx],
+        "val": [pool[i] for i in va_idx],
+        "test": recs["test"],
     }
-    path = lambda r: str(raw_dir / r["dir"] / r["name"])  # noqa: E731
-    pad = np.rint(mean_rgb([path(r) for r in splits["train"]])).astype(int)
+    logger.info(
+        f"dropped {len(dropped)} train/extra images longer than {max_len} digits, "
+        + ", ".join(f"{k} {len(v)}" for k, v in splits.items())
+    )
+
+    def path(r: dict) -> str:
+        return str(raw_dir / r["dir"] / r["name"])
+
     summary = {}
-    for name, recs in splits.items():
-        imgs, geom = letterbox_images([path(r) for r in recs], height, width, pad.tolist())
-        np.save(out_dir / f"{name}_images.npy", imgs)
-        np.save(out_dir / f"{name}_geometry.npy", geom)
-        (out_dir / f"{name}_labels.json").write_text(
-            json.dumps(
-                [
-                    {"name": r["name"], "dir": r["dir"], "label": r["label"], "boxes": r["boxes"]}
-                    for r in recs
-                ]
-            )
+    for name, rs in splits.items():
+        crops = np.array([r["crop"] for r in rs], np.float32).reshape(-1, 4)
+        geom = _write_cache(
+            out_dir / f"{name}_images.npy", [path(r) for r in rs], size, crops, True, [0] * 3, chunk
         )
+        (out_dir / f"{name}_labels.json").write_text(_labels_json(rs, geom))
         summary[name] = {
-            "n_images": len(recs),
-            "length_hist": length_hist([r["label"] for r in recs]),
-            "source_width_pct_5_50_95": np.percentile(geom[:, 0], [5, 50, 95]).tolist()
-            if len(recs)
-            else None,
-            "source_height_pct_5_50_95": np.percentile(geom[:, 1], [5, 50, 95]).tolist()
-            if len(recs)
+            "n_images": len(rs),
+            "by_source": {s: c for s in SOURCES if (c := sum(r["dir"] == s for r in rs))},
+            "length_hist": length_hist([r["label"] for r in rs]),
+            "crop_width_px_pct_5_50_95": np.percentile(geom[:, 0], [5, 50, 95]).tolist()
+            if rs
             else None,
         }
+    pad = np.rint(_channel_mean(out_dir / "train_images.npy")).astype(int).tolist()
+    test = splits["test"]
+    geom = _write_cache(
+        out_dir / "test_whole_images.npy", [path(r) for r in test], size, None, False, pad, chunk
+    )
+    (out_dir / "test_whole_labels.json").write_text(_labels_json(test, geom))
+    summary["test_whole"] = {"n_images": len(test), "length_hist": summary["test"]["length_hist"]}
+
     audit = {
-        "dataset": "SVHN Format 1 (full numbers)",
+        "dataset": "SVHN Format 1 (full numbers), cropped protocol",
         "url": URL,
-        "raw_files": ["train.tar.gz", "test.tar.gz"],
+        "raw_files": [f"{s}.tar.gz" for s in SOURCES],
         "image_format": "PNG, RGB, variable size",
-        "content": "house-number digits cropped from Google Street View photos",
-        "label_rule": "digits of each image ordered by increasing bounding-box left, MATLAB label 10 -> 0",
-        "canvas": [height, width, 3],
-        "resize_rule": "aspect ratio kept, bilinear (triangle) resize to fit, centered, padded with train mean RGB",
-        "pad_rgb": pad.tolist(),
-        "split_rule": "official test untouched, official train split 90/10 by sha1(salt+name) within each length",
-        "vocabulary": {"PAD": PAD, "SOS": SOS, "EOS": EOS, "digits": "token = 3 + digit"},
-        "max_len": max(len(r["label"]) for r in train_recs),
+        "content": "house-number digits from Google Street View photos",
+        "counts_per_source": {s: len(recs[s]) for s in SOURCES},
+        "length_hist_per_source": {s: length_hist([r["label"] for r in recs[s]]) for s in SOURCES},
+        "dropped_long_labels": {
+            "rule": f"train/extra images with more than {max_len} digits are removed",
+            "count": len(dropped),
+            "by_source": {s: sum(r["dir"] == s for r in dropped) for s in ("train", "extra")},
+            "images": [{"key": record_key(r), "label": r["label"]} for r in dropped],
+        },
+        "pool_size_before_split": len(pool),
+        "label_rule": "digits ordered by increasing bounding-box left, MATLAB label 10 -> 0",
+        "split_rule": (
+            f"train+extra merged, {1 - val_frac:.0%}/{val_frac:.0%} train/val by "
+            "sha1(salt + dir/name) within each length; official test untouched"
+        ),
+        "crop_rule": (
+            "union of the digit boxes, squared around its center with side max(w, h), expanded "
+            f"{CROP_EXPAND}x (0.15*side each way), clamped to the image, resized to "
+            f"{size}x{size} RGB ignoring the aspect ratio (bilinear/triangle). Test crops use "
+            "the ground-truth boxes (oracle localization)"
+        ),
+        "train_crop": "random 54x54 crop of the 64x64 cache plus ColorJitter (training only)",
+        "eval_crop": "center 54x54 crop",
+        "test_whole_rule": (
+            f"whole test image letterboxed into {size}x{size}, aspect kept, padded with the "
+            "mean RGB of the train crop cache (stress test, not the primary protocol)"
+        ),
+        "whole_pad_rgb": pad,
+        "normalization": {"mean": list(NORM_MEAN), "std": list(NORM_STD), "scale": "x / 255"},
+        "canvas": [size, size, 3],
+        "vocabulary": {"PAD": PAD, "SOS": SOS, "EOS": EOS, "digits": f"token = {DIGIT0} + digit"},
+        "max_len": max_len,
         "splits": summary,
     }
     (out_dir / "svhn_audit.json").write_text(json.dumps(audit, indent=2))
     return audit
 
 
-def encode(label: str, max_len: int) -> list[int]:
+# --- training-time access -----------------------------------------------------------
+
+
+def encode(label: str, max_len: int = MAX_LEN) -> list[int]:
     """Decoder targets: d1 .. dn EOS PAD .., length max_len + 1."""
+    if len(label) > max_len:
+        raise ValueError(f"label {label!r} longer than max_len={max_len}")
     ids = [DIGIT0 + int(c) for c in label] + [EOS]
     return ids + [PAD] * (max_len + 1 - len(ids))
 
 
-def decode(ids: list[int]) -> str:
+def decode(ids: Sequence[int]) -> str:
     out = []
     for i in ids:
         if i == EOS:
@@ -151,70 +342,100 @@ def decode(ids: list[int]) -> str:
 
 @dataclass
 class OcrBatch:
-    images: torch.Tensor  # (B, 3, H, W) normalized float
-    tokens: torch.Tensor  # (B, max_len + 1) decoder targets
+    images: torch.Tensor  # (B, 3, crop, crop) normalized float
+    tokens: torch.Tensor  # (B, max_len + 1) decoder targets d1..dn EOS PAD..
+    lengths: torch.Tensor  # (B,) length class, number of digits - 1
     index: torch.Tensor  # (B,) row in the split
 
 
-class SvhnSplit:
-    """One cached split held on the device as uint8, with GPU-side augmentation."""
+def crop_batch(x: torch.Tensor, offsets: torch.Tensor, crop: int) -> torch.Tensor:
+    """x (B, C, H, W), offsets (B, 2) as (top, left) -> (B, C, crop, crop)."""
+    ar = torch.arange(crop, device=x.device)
+    rows = offsets[:, 0, None] + ar
+    cols = offsets[:, 1, None] + ar
+    bi = torch.arange(x.shape[0], device=x.device)[:, None, None]
+    # advanced indices around a slice put the broadcast dims first: (B, crop, crop, C)
+    return x[bi, :, rows[:, :, None], cols[:, None, :]].permute(0, 3, 1, 2)
 
-    def __init__(self, cache_dir: Path, split: str, max_len: int, device: str = "cpu") -> None:
-        imgs = np.load(cache_dir / f"{split}_images.npy", mmap_mode="r")
-        self.records = json.loads((cache_dir / f"{split}_labels.json").read_text())
-        self.labels = [r["label"] for r in self.records]
-        self.images = torch.from_numpy(np.array(imgs)).to(device).permute(0, 3, 1, 2)
-        self.tokens = torch.tensor([encode(s, max_len) for s in self.labels], device=device)
-        self.device = device
-        self.mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+
+def color_jitter(x: torch.Tensor, factors: torch.Tensor) -> torch.Tensor:
+    """Per-image brightness, contrast and saturation (torchvision formulas, fixed order).
+
+    x (B, 3, H, W) in [0, 1], factors (B, 3). No hue change.
+    """
+    f = factors.to(x.dtype).view(-1, 3, 1, 1, 1).unbind(1)
+    x = (x * f[0]).clamp(0, 1)
+    gray = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    mean = gray.mean(dim=(1, 2, 3), keepdim=True)
+    x = (f[1] * x + (1 - f[1]) * mean).clamp(0, 1)
+    gray = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    return (f[2] * x + (1 - f[2]) * gray).clamp(0, 1)
+
+
+class SvhnSplit:
+    """One cached split held on the device as (N, 3, size, size) uint8.
+
+    Training batches take a random crop per image and apply ColorJitter on the device,
+    evaluation batches take the center crop. All random numbers come from the CPU
+    generator passed in, so a resumed epoch sees exactly the same augmentation.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        split: str,
+        max_len: int = MAX_LEN,
+        device: str = "cpu",
+        crop: int = 54,
+        jitter: float = 0.3,
+        limit: int | None = None,
+    ) -> None:
+        imgs = np.load(Path(cache_dir) / f"{split}_images.npy", mmap_mode="r")
+        records = json.loads((Path(cache_dir) / f"{split}_labels.json").read_text())
+        if limit is not None:
+            imgs, records = imgs[:limit], records[:limit]
+        self.split, self.records = split, records
+        self.labels = [r["label"] for r in records]
+        x = torch.from_numpy(np.array(imgs)).to(device)  # copy: the memmap is read-only
+        self.images = x.permute(0, 3, 1, 2).contiguous()
+        self.tokens = torch.tensor(
+            [encode(s, max_len) for s in self.labels], dtype=torch.long, device=device
+        ).reshape(-1, max_len + 1)
+        self.lengths = torch.tensor(
+            [len(s) - 1 for s in self.labels], dtype=torch.long, device=device
+        )
+        self.device, self.crop, self.jitter = device, crop, jitter
+        self.size = int(self.images.shape[-1])
+        if not 0 < crop <= self.size:
+            raise ValueError(f"crop {crop} does not fit the {self.size}px cache")
+        self.mean = torch.tensor(NORM_MEAN, device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(NORM_STD, device=device).view(1, 3, 1, 1)
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def batch(
-        self, idx: torch.Tensor, augment: dict | None = None, g: torch.Generator | None = None
+        self, idx: torch.Tensor, train: bool = False, g: torch.Generator | None = None
     ) -> OcrBatch:
         idx = idx.to(self.device)
-        x = self.images[idx].float() / 255.0
-        if augment:
-            x = random_affine_color(x, augment, g)
+        b, margin = len(idx), self.size - self.crop
+        if train:
+            off = torch.randint(0, margin + 1, (b, 2), generator=g)
+            factors = 1 + (torch.rand(b, 3, generator=g) * 2 - 1) * self.jitter
+        else:
+            off = torch.full((b, 2), margin // 2, dtype=torch.long)
+            factors = None
+        x = crop_batch(self.images[idx], off.to(self.device), self.crop).float() / 255.0
+        if factors is not None and self.jitter > 0:
+            x = color_jitter(x, factors.to(self.device))
         x = (x - self.mean) / self.std
-        return OcrBatch(x, self.tokens[idx], idx)
+        return OcrBatch(x, self.tokens[idx], self.lengths[idx], idx)
 
     def iterate(
-        self, batch_size: int, augment: dict | None = None, g: torch.Generator | None = None
-    ):
-        order = torch.randperm(len(self), generator=g) if g is not None else torch.arange(len(self))
-        for i in range(0, len(self), batch_size):
-            yield self.batch(order[i : i + batch_size], augment, g)
-
-
-def random_affine_color(x: torch.Tensor, aug: dict, g: torch.Generator | None) -> torch.Tensor:
-    """Label-preserving augmentation on the device. Shift, scale, small rotation (no flips),
-    then per-image brightness and contrast. Random numbers come from the CPU generator `g`
-    so a resumed epoch sees the same augmentation."""
-    b = x.shape[0]
-    r = torch.rand(b, 6, generator=g).to(x.device)
-    ang = (r[:, 0] * 2 - 1) * np.deg2rad(aug["max_rotation"])
-    lo, hi = aug["scale"]
-    s = lo + r[:, 1] * (hi - lo)
-    tx = (r[:, 2] * 2 - 1) * aug["max_shift"] * 2
-    ty = (r[:, 3] * 2 - 1) * aug["max_shift"] * 2
-    h, w = x.shape[-2:]
-    aspect = w / h
-    cos, sin = torch.cos(ang) / s, torch.sin(ang) / s
-    theta = torch.stack(
-        [
-            torch.stack([cos, -sin / aspect, tx], -1),
-            torch.stack([sin * aspect, cos, ty], -1),
-        ],
-        dim=1,
-    )
-    grid = F.affine_grid(theta, list(x.shape), align_corners=False)
-    x = F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=False)
-    bright = 1 + (r[:, 4] * 2 - 1) * aug["brightness"]
-    contrast = 1 + (r[:, 5] * 2 - 1) * aug["contrast"]
-    mean = x.mean(dim=(1, 2, 3), keepdim=True)
-    x = (x - mean) * contrast.view(-1, 1, 1, 1) + mean
-    return (x * bright.view(-1, 1, 1, 1)).clamp(0, 1)
+        self, batch_size: int, train: bool = False, g: torch.Generator | None = None
+    ) -> Iterator[OcrBatch]:
+        """Shuffled augmented batches when train, else the split in order with center crops."""
+        n = len(self)
+        order = torch.randperm(n, generator=g) if train else torch.arange(n)
+        for i in range(0, n, batch_size):
+            yield self.batch(order[i : i + batch_size], train, g)

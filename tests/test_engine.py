@@ -67,3 +67,23 @@ def test_step_schedule_drops_lr_and_resumes(tmp_path):
     _, h = fit(tmp_path / "s", m, [{"params": m.parameters()}], batches, step, val, cfg, seed=0)
     lrs = [round(r["lr"], 6) for r in h]
     assert lrs == [0.01, 0.001, 0.001, 0.0001]
+
+
+def test_prepare_run_dir_blocks_stale_checkpoints(tmp_path):
+    import pytest
+
+    from dl_final_prj.engine import prepare_run_dir
+
+    run = tmp_path / "run"
+    prepare_run_dir(run, {"lr": 1e-3, "data": {"size": 1}}, force=False)
+    (run / "ckpt.pt").write_text("x")
+    prepare_run_dir(run, {"lr": 1e-3, "data": {"size": 1}}, force=False)  # same settings resume
+    with pytest.raises(ValueError):
+        prepare_run_dir(run, {"lr": 5e-4, "data": {"size": 1}}, force=False)
+    prepare_run_dir(run, {"lr": 5e-4, "data": {"size": 1}}, force=True)  # force wipes the run
+    assert not (run / "ckpt.pt").exists()
+    other = tmp_path / "legacy"
+    other.mkdir()
+    (other / "ckpt.pt").write_text("x")
+    with pytest.raises(ValueError):
+        prepare_run_dir(other, {"lr": 1e-3}, force=False)

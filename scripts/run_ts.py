@@ -1,4 +1,9 @@
-"""Train (or resume) one Task 1/2 neural model for one seed and write its predictions and metrics."""
+"""Train (or resume) one Task 1/2 neural model for one seed and write its predictions and metrics.
+
+The models predict the standardized seasonal residual r(tau) = y(tau) - y(tau-24) (plan
+Sections 2.1 and 2.2). The loss is MSE on that standardized residual. Validation and all
+reported metrics are in kW after adding back the daily base y(tau-24).
+"""
 
 import argparse
 import time
@@ -10,16 +15,25 @@ import yaml
 from loguru import logger
 
 from dl_final_prj.electricity import ElectricityData
-from dl_final_prj.engine import FitConfig, fit, pick_device, set_seed, write_json
+from dl_final_prj.engine import (
+    FitConfig,
+    file_identity,
+    fit,
+    pick_device,
+    prepare_run_dir,
+    set_seed,
+    write_json,
+)
 from dl_final_prj.metrics import horizon_report, regression_report
 from dl_final_prj.ts_models import BiRNNForecaster, Seq2SeqForecaster, count_params
 
 
 def build_model(kind: str, args: dict, data: ElectricityData) -> torch.nn.Module:
+    common = {"horizon": data.horizon, "n_target_feats": data.n_target_feats}
     if kind == "birnn":
-        return BiRNNForecaster(data.n_features, horizon=data.horizon, **args)
+        return BiRNNForecaster(data.n_features, **common, **args)
     if kind == "seq2seq":
-        return Seq2SeqForecaster(data.n_features, data.target_col, horizon=data.horizon, **args)
+        return Seq2SeqForecaster(data.n_features, **common, **args)
     raise ValueError(kind)
 
 
@@ -33,6 +47,7 @@ def tf_ratio(tf: dict | None, epoch: int) -> float:
 
 @torch.no_grad()
 def predict(model, data: ElectricityData, split: str, bs: int, keep_attention: bool = False):
+    """kW predictions (n, H) for every origin of `split` in time order, plus test attention."""
     model.eval()
     preds, attn = [], []
     for b in data.iterate(split, bs):
@@ -40,7 +55,7 @@ def predict(model, data: ElectricityData, split: str, bs: int, keep_attention: b
         preds.append(p.float().cpu().numpy())
         if keep_attention and "attention" in aux:
             attn.append(aux["attention"].float().cpu().numpy().astype(np.float16))
-    pred = data.inverse(np.concatenate(preds))
+    pred = data.inverse(np.concatenate(preds), data.origins[split])
     return pred, (np.concatenate(attn) if attn else None)
 
 
@@ -64,10 +79,23 @@ def main() -> None:
     if (run_dir / "metrics.json").exists() and not a.force:
         logger.info(f"{run_dir} already done")
         return
+    npz = Path(a.npz or cfg["electricity_npz"])
+    fingerprint = {
+        "task": {k: v for k, v in tcfg.items() if k != "models"},
+        "model": mcfg,
+        "seed": a.seed,
+        "smoke": a.smoke,
+        "data": file_identity(npz),
+    }
+    prepare_run_dir(run_dir, fingerprint, a.force)
     set_seed(a.seed)  # seeds the weight initialization too, not only training
     device = pick_device()
     data = ElectricityData(
-        Path(a.npz or cfg["electricity_npz"]), tcfg["lookback"], tuple(tcfg["offsets"]), device
+        Path(a.npz or cfg["electricity_npz"]),
+        tcfg["lookback"],
+        tuple(tcfg["offsets"]),
+        device,
+        target_only=tcfg.get("target_only", True),
     )
     model = build_model(mcfg["kind"], mcfg["args"], data).to(device)
     fcfg = FitConfig(**tcfg["fit"])
@@ -114,6 +142,7 @@ def main() -> None:
             "hour": data.hours[o].to_numpy("datetime64[s]"),
             "y_true": y,
             "y_pred": pred,
+            "base_b24": data.base_b24(o),
         }
         if attn is not None:
             arrays["attention"] = attn
@@ -130,9 +159,12 @@ def main() -> None:
         "n_params": count_params(model),
         "input_shape": [tcfg["lookback"], data.n_features],
         "input_features": data.feature_names,
+        "target_features_shape": [data.horizon, data.n_target_feats],
         "output_shape": [data.horizon],
         "offsets": list(data.offsets),
-        "loss": "MSE on train-standardized target",
+        "features": data.feature_summary(),
+        "loss": "MSE on the train-standardized seasonal residual",
+        "validation_metric": "RMSE in kW after adding back y(tau-24)",
         "optimizer": "AdamW",
         "fit": vars(fcfg),
         "batch_size": bs,
