@@ -1,0 +1,106 @@
+# Phase 2 Task 3 of docs/experiment_plan.md (Sections 2.3 Phase 2, 3 rows T3-M0..M4, 3.1).
+# Data, crop, fit and decoding settings are copied from configs/phase1_task3.yaml. Only the
+# models differ. Runs go to results/phase2/runs/task3/<model>/seed<s>.
+#
+# All models: Phase 1 VGG-BN CNN (512x7x7) -> Linear(512, 256) per token -> learned 2-D
+# row/col position embeddings -> token mixer -> Phase 1 2-layer GRU decoder (hidden 256),
+# Bahdanau attention over the 49 mixed tokens, length head on the mean token.
+#
+# Token mixer skeleton (shared by M0 and M1, so M0 vs M1 changes only the sequence operator):
+#   2 x [ x + Linear(2*256, 256)(cat[fwd(RMSNorm(x)), flip(bwd(flip(RMSNorm(x))))]) ]
+#   -> final RMSNorm. Both directions are fused inside every layer (Vision Mamba style).
+#   M0: fwd/bwd are Mamba-1 mixers. M1: one 1-layer bidirectional nn.GRU per layer.
+#
+# Trainable parameters (seed independent, see ocr_mamba.MixerAttentionGRURecognizer):
+#   model   total      token mixer  vs t3_m0
+#   t3_m0   7,947,282  2,014,464    0
+#   t3_m1   7,942,546  2,009,728    -0.06%  (BiGRU hidden 272 per layer)
+#   t3_m2   7,945,362  2,012,544    -0.02%  (static dt/B/C + low-rank adapter)
+#   t3_m3   7,685,138  1,752,320    -3.30%  (forward only, 4 layers, see below)
+#   t3_m4   7,943,698  2,014,464    -0.05%  (no position embeddings, -3,584)
+# Shared parts: CNN 4,687,296, token projection 131,328, positions 3,584, decoder+heads
+# 1,110,610.
+#
+# t3_m3 compensation. A 2-layer forward-only stack would be 6,809,106 (-14.3%), outside the
+# 5% rule of plan Section 3. t3_m3 uses 4 forward layers with the M0 mixer config unchanged
+# (d_inner 512, d_state 16). It keeps the per-mixer width, state size and the number of
+# Mamba mixers (4) and their scan FLOPs equal to t3_m0, so only the scan direction differs
+# (plus sequential depth, and it has no fusion Linear). Widening d_inner instead would also
+# change the state width (rejected).
+#
+# Deviation from plan 2.3 (lead decision pending, also in spec.json param_match). Plan 2.3
+# asks for T3-M0 within 5% of the Phase 1 cnn_attention_gru (T3-P0, 6,202,898). t3_m0 is
+# +28.1%. With the plan's fixed settings (d_model 256, two residual bidirectional blocks,
+# expand 2, d_state 16, d_conv 4) the mixer alone is 2.0M, and the 5% ceiling leaves 0.58M.
+# So t3_m0 is matched to its controls (t3_m1..t3_m4) instead, and the Mamba claim of plan
+# 3.1 rests on t3_m0 vs t3_m1 and t3_m2. Do not report t3_m0 vs T3-P0 as budget matched.
+#
+# Scan. `scan: parallel` (log-depth) and `scan: loop` give the same result. Time both on the
+# A100 with `scripts/run_ocr.py --bench` before the locked runs and keep the faster one.
+title: "Full house-number recognition from cropped SVHN images"
+phase: phase2
+seeds: [0, 1, 2]
+results_root: results
+svhn_dir: data/processed/svhn
+size: 64
+crop: 54
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit: {epochs: 16, patience: 16, lr: 3.0e-4, weight_decay: 1.0e-4, clip: 5.0, schedule: step, step_epoch: 10, step_gamma: 0.1, amp: bf16}
+length_loss_weight: 0.2
+color_jitter: 0.3
+models:
+  t3_m0:  # proposed: 2 residual bidirectional selective Mamba-1 layers, per-layer fusion
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 256
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}
+  t3_m1:  # matched control: same skeleton, 2 residual 1-layer BiGRU layers, hidden 272
+    kind: gru_mixer_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 256
+      pos_emb: true
+      gru_hidden: 272
+      gru_layers: 2
+      gru_direction: bi
+  t3_m2:  # static-state control: input-independent dt, B, C (capacity kept by an adapter)
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 256
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: true, scan: parallel}
+  t3_m3:  # forward-only raster scan, 4 layers of the unchanged M0 mixer (same mixer count)
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 256
+      pos_emb: true
+      mamba: {kind: mamba1, fusion: layer, n_layers: 4, direction: forward, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}
+  t3_m4:  # t3_m0 without the learned 2-D position embeddings
+    kind: mamba_attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      d_model: 256
+      pos_emb: false
+      mamba: {kind: mamba1, fusion: layer, n_layers: 2, direction: bi, d_state: 16, d_conv: 4, expand: 2, static: false, scan: parallel}

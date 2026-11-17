@@ -390,8 +390,13 @@ def ctc_greedy(logits: torch.Tensor) -> list[str]:
 
 
 def build(kind: str, args: dict | None = None, max_len: int = MAX_LEN, **extra) -> nn.Module:
-    """Model from its config kind: attention, pooled, multihead or ctc."""
+    """Model from its config kind: attention, pooled, multihead or ctc (Phase 1), or
+    mamba_attention or gru_mixer_attention (Phase 2, see ocr_mamba)."""
     args = dict(args or {})
+    if kind in ("mamba_attention", "gru_mixer_attention"):
+        from dl_final_prj.ocr_mamba import build_mixer_recognizer  # lazy: ocr_mamba imports us
+
+        return build_mixer_recognizer(kind, max_len=max_len, **args, **extra)
     if kind in ("attention", "pooled"):
         cls = AttentionGRURecognizer if kind == "attention" else PooledGRURecognizer
         return cls(max_len=max_len, **args, **extra)

@@ -3,10 +3,15 @@
 Selection is early stopping on validation exact-match (greedy). The restored best checkpoint
 is evaluated on val, test (primary, oracle GT-box crop), test_length_constrained and
 test_beam3 (GRU decoders only) and test_whole (whole-image letterbox stress test).
+
+Phase 2 (configs/phase2_task3.yaml, `phase: phase2`) adds the token-mixer kinds of
+ocr_mamba. Their runs go to results/phase2/... and Mamba runs also save the mean dt per
+visual token on the test set (mamba_dt_test.npz).
 """
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -25,10 +30,14 @@ from dl_final_prj.engine import (
     write_json,
 )
 from dl_final_prj.metrics import sequence_report
+from dl_final_prj.ocr_mamba import P0_PARAMS, MixerAttentionGRURecognizer
 from dl_final_prj.ocr_models import build
-from dl_final_prj.svhn import DIGIT0, EOS, PAD, SOS, VOCAB, SvhnSplit
+from dl_final_prj.svhn import DIGIT0, EOS, PAD, SOS, VOCAB, OcrBatch, SvhnSplit, encode
 from dl_final_prj.ts_models import count_params
 
+MIXER_KINDS = ("mamba_attention", "gru_mixer_attention")  # Phase 2, ocr_mamba
+GRU_DECODER_KINDS = ("attention", "pooled", *MIXER_KINDS)
+ATTENTION_KINDS = ("attention", *MIXER_KINDS)
 SMOKE_SIZES = {"train": 2000, "val": 500, "test": 500, "test_whole": 500}
 # metrics.json key -> (cached split, decoding mode)
 EVALS = {
@@ -59,6 +68,116 @@ def predict(model, split: SvhnSplit, mode: str, bs: int, amp: bool, keep_attenti
     return preds, (np.concatenate(attn) if attn else None)
 
 
+@torch.no_grad()
+def mamba_diagnostics(model, split: SvhnSplit, bs: int, amp: bool) -> dict | None:
+    """Mean dt per visual token (N, n_dirs, n_layers, 49) for a Mamba token mixer, else None."""
+    if not isinstance(model, MixerAttentionGRURecognizer):
+        return None
+    model.eval()
+    dts, diag = [], {}
+    for b in split.iterate(bs):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            diag = model.mixer_diagnostics(b.images)
+        if "dt_mean" not in diag:
+            return None
+        dts.append(diag["dt_mean"].float().cpu().numpy())
+    return {
+        "dt_mean": np.concatenate(dts),
+        "directions": np.array(diag["directions"]),
+        "static": np.array(diag["static"]),
+        "notes": np.array(diag["notes"]),
+    }
+
+
+def mixer_architecture(model: MixerAttentionGRURecognizer, crop: int) -> dict:
+    """Extra spec.json architecture keys of a Phase 2 token-mixer recognizer."""
+    enc = model.encoder
+    return {
+        "encoder_grid": [512, 7, 7],
+        "token_projection": f"Linear(512, {enc.dim}) per visual token (raster order)",
+        "position_embeddings": f"learned row/col (7 each), {enc.dim}-d, added after the projection"
+        if enc.row is not None
+        else None,
+        "token_mixer": enc.describe_mixer(),
+        "token_mixer_precision": "fp32 (autocast off), CNN under autocast",
+        "decoder_token_dim": enc.dim,
+        "n_params_breakdown": model.param_breakdown(),
+        "input_crop": crop,
+    }
+
+
+def param_match(model: MixerAttentionGRURecognizer) -> dict:
+    """spec.json record of the plan 2.3 P0 budget deviation (see configs/phase2_task3.yaml)."""
+    n = count_params(model)
+    return {
+        "matched_control": "t3_m1 (and t3_m2..t3_m4), all within 5% of t3_m0",
+        "t3_p0_cnn_attention_gru_params": P0_PARAMS,
+        "rel_diff_vs_t3_p0": n / P0_PARAMS - 1,
+        "note": "plan 2.3 asks for T3-M0 within 5% of T3-P0. The plan's fixed Mamba settings "
+        "(two residual bidirectional blocks, d_model 256, expand 2, d_state 16) make that "
+        "impossible, so T3-M0 vs T3-P0 is not a budget-matched contrast",
+    }
+
+
+def bench(model, a, cfg: dict, device: str, amp: bool) -> None:
+    """Times `a.bench` training steps (AdamW, clip, bf16 autocast on CUDA) on random images
+    and labels at the config batch size. Logs ms/step, peak CUDA memory and the projected
+    train time per epoch and per run (validation and evaluation excluded). Writes nothing."""
+    bs, max_len, fcfg = cfg["batch_size"], cfg["max_len"], FitConfig(**cfg["fit"])
+    if a.compile:
+        enc = model.encoder
+        enc.mixer = torch.compile(enc.mixer)  # type: ignore[assignment]
+    g = torch.Generator().manual_seed(0)
+    lengths = torch.randint(1, max_len + 1, (bs,), generator=g)
+    labels = [
+        "".join(str(int(d)) for d in torch.randint(0, 10, (int(n),), generator=g)) for n in lengths
+    ]
+    tokens = torch.tensor([encode(s, max_len) for s in labels], device=device)
+    images = torch.randn(bs, 3, cfg["crop"], cfg["crop"], generator=g).to(device)
+    batch = OcrBatch(images, tokens, (lengths - 1).to(device), torch.arange(bs, device=device))
+    opt = torch.optim.AdamW(model.parameters(), lr=fcfg.lr, weight_decay=fcfg.weight_decay)
+    model.train()
+
+    def step() -> None:
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            loss = model.loss(batch)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), fcfg.clip)
+        opt.step()
+
+    def sync() -> None:
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    for _ in range(a.bench_warmup):
+        step()
+    sync()
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    for _ in range(a.bench):
+        step()
+    sync()
+    sec = (time.perf_counter() - t0) / a.bench
+    labels_path = Path(a.cache or cfg["svhn_dir"]) / "train_labels.json"
+    n_train = len(json.loads(labels_path.read_text())) if labels_path.exists() else None
+    epoch_s = math.ceil(n_train / bs) * sec if n_train else None
+    out = {
+        "model": a.model,
+        "scan": (cfg["models"][a.model].get("args") or {}).get("mamba", {}).get("scan"),
+        "compile": a.compile,
+        "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
+        "batch_size": bs,
+        "ms_per_step": 1000 * sec,
+        "peak_cuda_mem_gb": torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None,
+        "n_train": n_train,
+        "train_min_per_epoch": epoch_s / 60 if epoch_s else None,
+        "train_h_per_run": epoch_s * fcfg.epochs / 3600 if epoch_s else None,
+    }
+    logger.info(f"bench {json.dumps(out)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
@@ -68,12 +187,33 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="override results_root")
     ap.add_argument("--smoke", action="store_true", help="2 epochs on 2,000/500/500 images")
     ap.add_argument("--force", action="store_true")
+    bench_help = "time N training steps on random data and exit, no run directory (Phase 2)"
+    ap.add_argument("--bench", type=int, default=0, metavar="N", help=bench_help)
+    ap.add_argument("--bench-warmup", type=int, default=5)
+    ap.add_argument("--scan", choices=["parallel", "loop"], help="--bench only: Mamba scan")
+    ap.add_argument("--compile", action="store_true", help="--bench only: torch.compile mixer")
     a = ap.parse_args()
 
     cfg = yaml.safe_load(Path(a.config).read_text())
     mcfg = cfg["models"][a.model]
     kind = mcfg["kind"]
-    root = Path(a.out or cfg["results_root"]) / ("smoke" if a.smoke else "phase1")
+    if a.bench:
+        if a.scan:
+            args = mcfg.setdefault("args", {})
+            args["mamba"] = dict(args.get("mamba") or {}) | {"scan": a.scan}
+        device = pick_device()
+        set_seed(a.seed)
+        extra = (
+            {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
+        )
+        model = build(kind, mcfg.get("args"), cfg["max_len"], **extra).to(device)
+        fcfg = FitConfig(**cfg["fit"])
+        bench(model, a, cfg, device, fcfg.amp == "bf16" and device == "cuda")
+        return
+    if a.scan or a.compile:
+        ap.error("--scan and --compile only apply to --bench (set mamba.scan in the config)")
+    phase = cfg.get("phase", "phase1")
+    root = Path(a.out or cfg["results_root"]) / ("smoke" if a.smoke else phase)
     run_dir = root / "runs" / "task3" / a.model / f"seed{a.seed}"
     if (run_dir / "metrics.json").exists() and not a.force:
         logger.info(f"{run_dir} already done")
@@ -104,9 +244,7 @@ def main() -> None:
     logger.info(f"loaded {', '.join(f'{s} {len(d)}' for s, d in data.items())} on {device}")
 
     set_seed(a.seed)  # seeds the weight initialization too, not only training
-    extra = (
-        {"length_loss_weight": cfg["length_loss_weight"]} if kind in ("attention", "pooled") else {}
-    )
+    extra = {"length_loss_weight": cfg["length_loss_weight"]} if kind in GRU_DECODER_KINDS else {}
     model = build(kind, mcfg.get("args"), max_len, **extra).to(device)
     fcfg = FitConfig(**cfg["fit"])
     amp = fcfg.amp == "bf16" and device == "cuda"
@@ -135,7 +273,7 @@ def main() -> None:
     for key, (split, mode) in EVALS.items():
         if mode not in modes:
             continue
-        keep = key == "test" and kind == "attention"
+        keep = key == "test" and kind in ATTENTION_KINDS
         preds, attn = predict(model, data[split], mode, ebs, amp, keep_attention=keep)
         metrics[key] = sequence_report(data[split].labels, preds)
         rows = [
@@ -145,6 +283,10 @@ def main() -> None:
         (run_dir / f"pred_{key}.json").write_text(json.dumps(rows))
         if attn is not None:
             np.savez_compressed(run_dir / "attention_test.npz", attention=attn)
+
+    diag = mamba_diagnostics(model, data["test"], ebs, amp)
+    if diag is not None:
+        np.savez_compressed(run_dir / "mamba_dt_test.npz", **diag)
 
     best_epoch = int(np.argmin([h["val"] for h in history])) + 1
     audit_path = cache / "svhn_audit.json"
@@ -159,13 +301,18 @@ def main() -> None:
         "digits": f"token = {DIGIT0} + digit",
         "size": VOCAB,
     }
-    vocab = {
-        "attention": gru_vocab,
-        "pooled": gru_vocab,
-        "multihead": {"length_classes": f"1..{max_len}", "digit_classes": "0..9 per head"},
-        "ctc": {"blank": 0, "digits": "class = 1 + digit", "size": 11},
-    }[kind]
+    vocab = (
+        {
+            "attention": gru_vocab,
+            "pooled": gru_vocab,
+            "multihead": {"length_classes": f"1..{max_len}", "digit_classes": "0..9 per head"},
+            "ctc": {"blank": 0, "digits": "class = 1 + digit", "size": 11},
+        }[kind]
+        if kind not in MIXER_KINDS
+        else gru_vocab
+    )
     grid = [512, 7, 14] if kind == "ctc" else [512, 7, 7]
+    d_tok = model.encoder.dim if isinstance(model, MixerAttentionGRURecognizer) else 512
     spec = {
         "task": 3,
         "model": a.model,
@@ -202,16 +349,20 @@ def main() -> None:
             "multihead": f"Linear({fc_dim}, {max_len}) on the FC trunk, lengths 1..{max_len}, "
             "CE weight 1, decides how many digit heads are read",
             "ctc": None,
-        }[kind],
+        }.get(
+            kind,
+            f"Linear({d_tok}, {max_len}) on the mean mixed token, lengths 1..{max_len}, "
+            f"CE weight {w_len}, used by length-constrained decoding",
+        ),
         "loss": {
             "attention": f"token CE (PAD ignored) + {cfg['length_loss_weight']} * length CE",
             "pooled": f"token CE (PAD ignored) + {cfg['length_loss_weight']} * length CE",
             "multihead": "length CE + sum of digit CE over the true positions",
             "ctc": "CTC (fp32)",
-        }[kind],
-        "teacher_forcing": "full" if kind in ("attention", "pooled") else None,
+        }.get(kind, f"token CE (PAD ignored) + {cfg['length_loss_weight']} * length CE"),
+        "teacher_forcing": "full" if kind in GRU_DECODER_KINDS else None,
         "decoding_modes": {k: MODE_TEXT[m] for k, (_, m) in EVALS.items() if m in modes}
-        if kind in ("attention", "pooled")
+        if kind in GRU_DECODER_KINDS
         else {
             "multihead": "argmax length, then the first L digit heads",
             "ctc": "CTC best path",
@@ -237,6 +388,20 @@ def main() -> None:
         else None,
         "smoke": a.smoke,
     }
+    if isinstance(model, MixerAttentionGRURecognizer):
+        spec["architecture"] |= mixer_architecture(model, crop)
+        spec["phase"] = phase
+        spec["param_match"] = param_match(model)
+        spec["mamba_diagnostics"] = (
+            {
+                "file": "mamba_dt_test.npz",
+                "dt_mean": "test set, (N, n_directions, n_layers, 49) mean dt over channels per "
+                "visual token, raster order, reverse direction mapped back to original order",
+                "notes": str(diag["notes"]),
+            }
+            if diag is not None
+            else None
+        )
     write_json(history, run_dir / "history.json")
     write_json(spec, run_dir / "spec.json")
     write_json(metrics, run_dir / "metrics.json")
