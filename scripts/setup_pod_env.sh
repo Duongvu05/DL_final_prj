@@ -8,7 +8,10 @@ cd "$(dirname "$0")/.."
 export PATH=/home/data/.local/bin:/home/data/.cargo/bin:$PATH
 export CARGO_HOME=${CARGO_HOME:-/home/data/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-/home/data/.rustup}
 [ -x .venv/bin/python ] || uv venv --system-site-packages --python /usr/bin/python3 .venv
-uv pip install --python .venv/bin/python loguru h5py
+# Keep the image's NumPy 1.x: its torch/scipy builds are compiled against it, and a newer
+# h5py would otherwise pull NumPy 2 into the venv.
+SYS_NUMPY=$(/usr/bin/python3 -c "import numpy; print(numpy.__version__)")
+uv pip install --python .venv/bin/python loguru h5py "numpy==$SYS_NUMPY"
 uv pip install --python .venv/bin/python --no-deps --reinstall ./rust/dlfast
 uv pip install --python .venv/bin/python --no-deps -e .
 .venv/bin/python -c "import torch, dlfast, dl_final_prj; print(torch.__version__, torch.cuda.is_available())"
