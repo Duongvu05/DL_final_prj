@@ -67,11 +67,16 @@ LABELS = {
     "seasonal_daily": "Seasonal naive, daily",
     "persistence": "Persistence",
 }
+OCR_FAMILIES = ["crnn_ctc", "multihead_cnn", "cnn_pool_gru", "cnn_attention_gru"]
+WHOLE = "_whole"  # Setting B (whole image, no GT boxes) runs carry this suffix
+for _m in OCR_FAMILIES:
+    COLORS[_m + WHOLE] = COLORS[_m]
+    LABELS[_m + WHOLE] = LABELS[_m]
 TS_BASE = ["persistence", "seasonal_daily", "seasonal_weekly", "ridge", "ridge_window"]
 ORDER = {
     1: [*TS_BASE, "bigru", "bigru_attention"],
     2: [*TS_BASE, "seq2seq", "seq2seq_attention"],
-    3: ["crnn_ctc", "multihead_cnn", "cnn_pool_gru", "cnn_attention_gru"],
+    3: [*OCR_FAMILIES, *(m + WHOLE for m in OCR_FAMILIES)],
 }
 MAIN = {1: "bigru_attention", 2: "seq2seq_attention", 3: "cnn_attention_gru"}
 CONTRASTS = {
@@ -91,9 +96,33 @@ CONTRASTS = {
         ("cnn_attention_gru", "cnn_pool_gru"),
         ("cnn_attention_gru", "multihead_cnn"),
         ("cnn_attention_gru", "crnn_ctc"),
+        ("cnn_attention_gru_whole", "cnn_pool_gru_whole"),
+        ("cnn_attention_gru_whole", "multihead_cnn_whole"),
+        ("cnn_attention_gru_whole", "crnn_ctc_whole"),
     ],
 }
-OCR_MODES = ("val", "test", "test_length_constrained", "test_beam3", "test_whole")
+# metrics.json keys written by run_ocr.py. "val"/"test" are the primary non-greedy decodings
+# (validation-selected beam width, CTC prefix beam or multi-head MAP); *_greedy are diagnostics;
+# test_whole is the crop-trained model on whole images (stress test, Setting A only).
+OCR_MODES = (
+    "val",
+    "val_greedy",
+    "test",
+    "test_greedy",
+    "test_length_constrained",
+    "test_whole",
+    "test_whole_greedy",
+)
+
+
+def setting_of(model: str) -> str:
+    return "B_whole_image" if model.endswith(WHOLE) else "A_oracle_crop"
+
+
+def family_of(model: str) -> str:
+    return model.removesuffix(WHOLE)
+
+
 METRICS = ["R2", "NSE", "MAE", "RMSE"]
 OCR_METRICS = [
     *METRICS,
@@ -177,10 +206,16 @@ def ocr_tables(root: Path, runs: dict) -> None:
         for seed, d in sorted(runs[model].items()):
             met = json.loads((d / "metrics.json").read_text())
             spec = json.loads((d / "spec.json").read_text())
+            dec = met.get("decoding", {})
             for split in [x for x in OCR_MODES if x in met]:
                 m = met[split]
                 rows.append(
-                    {"model": model, "seed": seed, "split": split, **{k: m[k] for k in OCR_METRICS},
+                    {"model": model, "family": family_of(model), "setting": setting_of(model),
+                     "seed": seed, "split": split,
+                     "decoding": "greedy" if split.endswith("_greedy") or split == "test_length_constrained"
+                     else dec.get("mode", "greedy (v1)"),
+                     "width": None if split.endswith("_greedy") else dec.get("width"),
+                     **{k: m[k] for k in OCR_METRICS},
                      **{k: v for k, v in m.items() if k.startswith(("pos_macro", "sample_macro"))},
                      "n_params": spec["n_params"], "epochs_run": spec["epochs_run"],
                      "best_epoch": spec["best_epoch"], "train_seconds": spec["train_seconds"]}
@@ -190,6 +225,7 @@ def ocr_tables(root: Path, runs: dict) -> None:
     parts = []
     for split in [x for x in OCR_MODES if x != "val" and x in set(df.split)]:
         sm = summarize(df[df.split == split], [*OCR_METRICS, "n_params", "train_seconds"])
+        sm["setting"] = sm.model.map(setting_of)
         parts.append(sm.assign(split=split))
     pd.concat(parts).to_csv(root / "task3_metrics_summary.csv", index=False)
 
@@ -410,56 +446,66 @@ def fig_task2_horizon(root: Path, figs: Path) -> None:
     save(fig, figs / "task2_horizon_metrics")
 
 
-def fig_task3(runs: dict, svhn_dir: Path, figs: Path) -> None:
-    if MAIN[3] not in runs:
-        return
-    d0 = runs[MAIN[3]][min(runs[MAIN[3]])]
-    preds = json.loads((d0 / "pred_test.json").read_text())
-    att_f = d0 / "attention_test.npz"
-    imgs = np.load(svhn_dir / "test_images.npy", mmap_mode="r")
-    if att_f.exists():
-        att = np.load(att_f)["attention"].astype(np.float32)
-        ok = [i for i, r in enumerate(preds) if r["target"] == r["pred"] and len(r["target"]) >= 3][
-            :3
-        ]
-        bad = [i for i, r in enumerate(preds) if r["target"] != r["pred"]][:3]
-        rows = ok + bad
-        steps = 1 + max(len(preds[i]["target"]) for i in rows)
-        fig, axes = plt.subplots(
-            len(rows), steps + 1, figsize=(1.4 * (steps + 1), 1.5 * len(rows) + 0.5)
-        )
-        g = math.isqrt(att.shape[-1])  # square token grid (7x7 for the VGG encoder)
-        for r, i in enumerate(rows):
-            img = np.asarray(imgs[i])[5:59, 5:59]  # the center 54x54 crop the model saw
-            axes[r, 0].imshow(img)
-            tag = "correct" if i in ok else "error"
-            axes[r, 0].set_title(f"{tag}: true {preds[i]['target']} / pred {preds[i]['pred'] or '-'}",
-                                 fontsize=7, loc="left", color=INK)  # fmt: skip
-            for k in range(steps):
-                ax = axes[r, k + 1]
-                ax.imshow(img)
-                if k <= len(preds[i]["pred"]):
-                    heat = att[i, k].reshape(g, g)
-                    ax.imshow(heat, cmap="magma", alpha=0.55, extent=(0, 54, 54, 0),
-                              interpolation="bilinear")  # fmt: skip
-                    ch = preds[i]["pred"][k] if k < len(preds[i]["pred"]) else "EOS"
-                    ax.set_title(f"step {k + 1}: {ch}", fontsize=7, color=INK2)
-            for ax in axes[r]:
-                ax.axis("off")
-        fig.suptitle("Task 3 test images with the attention map of each decoding step (seed 0)",
-                     fontsize=9, x=0.01, ha="left", color=INK)  # fmt: skip
-        save(fig, figs / "task3_examples_attention")
+SETTING_TEXT = {
+    "A_oracle_crop": "Setting A, oracle GT-box crop",
+    "B_whole_image": "Setting B, whole image",
+}
 
-    # Exact-match accuracy by number length and error types, mean over seeds
+
+def fig_task3(runs: dict, svhn_dir: Path, figs: Path, setting: str) -> None:
+    """Attention examples and length/error breakdown for one Task 3 setting (primary decoding)."""
+    suffix = WHOLE if setting == "B_whole_image" else ""
+    images_file = "test_full_images.npy" if suffix else "test_images.npy"
+    tag = "whole" if suffix else "crop"
+    main = MAIN[3] + suffix
+    if main in runs and (svhn_dir / images_file).exists():
+        d0 = runs[main][min(runs[main])]
+        preds = json.loads((d0 / "pred_test.json").read_text())
+        att_f = d0 / "attention_test.npz"
+        imgs = np.load(svhn_dir / images_file, mmap_mode="r")
+        if att_f.exists():
+            att = np.load(att_f)["attention"].astype(np.float32)
+            ok = [
+                i for i, r in enumerate(preds) if r["target"] == r["pred"] and len(r["target"]) >= 3
+            ]
+            bad = [i for i, r in enumerate(preds) if r["target"] != r["pred"]]
+            rows = ok[:3] + bad[:3]
+            steps = 1 + max(len(preds[i]["target"]) for i in rows)
+            fig, axes = plt.subplots(
+                len(rows), steps + 1, figsize=(1.4 * (steps + 1), 1.5 * len(rows) + 0.5)
+            )
+            g = math.isqrt(att.shape[-1])  # square token grid (7x7 for the VGG encoder)
+            for r, i in enumerate(rows):
+                img = np.asarray(imgs[i])[5:59, 5:59]  # the center 54x54 crop the model saw
+                axes[r, 0].imshow(img)
+                kind = "correct" if i in ok[:3] else "error"
+                axes[r, 0].set_title(f"{kind}: true {preds[i]['target']} / pred {preds[i]['pred'] or '-'}",
+                                     fontsize=7, loc="left", color=INK)  # fmt: skip
+                for k in range(steps):
+                    ax = axes[r, k + 1]
+                    ax.imshow(img)
+                    if k <= len(preds[i]["pred"]):
+                        heat = att[i, k].reshape(g, g)
+                        ax.imshow(heat, cmap="magma", alpha=0.55, extent=(0, 54, 54, 0),
+                                  interpolation="bilinear")  # fmt: skip
+                        ch = preds[i]["pred"][k] if k < len(preds[i]["pred"]) else "EOS"
+                        ax.set_title(f"step {k + 1}: {ch}", fontsize=7, color=INK2)
+                for ax in axes[r]:
+                    ax.axis("off")
+            fig.suptitle(f"Task 3, {SETTING_TEXT[setting]}: attention of each decoding step "
+                         "(primary beam decode, seed 0)", fontsize=9, x=0.01, ha="left", color=INK)  # fmt: skip
+            save(fig, figs / f"task3_examples_attention_{tag}")
+
+    models = [m for m in ORDER[3] if m in runs and setting_of(m) == setting]
+    if not models:
+        return
     fig, axes = plt.subplots(1, 2, figsize=(12, 3.4))
-    models = [m for m in ORDER[3] if m in runs]
-    width = 0.8 / max(1, len(models))
+    width = 0.8 / len(models)
     kinds = ["correct", "too short", "too long", "wrong digit"]
     for j, m in enumerate(models):
         acc_by_len, types = [], []
         for d in runs[m].values():
-            p = json.loads((d / "pred_test.json").read_text())
-            df = pd.DataFrame(p)
+            df = pd.DataFrame(json.loads((d / "pred_test.json").read_text()))
             df["L"] = df.target.str.len()
             df["ok"] = df.target == df.pred
             acc_by_len.append(df.groupby("L").ok.mean())
@@ -472,52 +518,53 @@ def fig_task3(runs: dict, svhn_dir: Path, figs: Path) -> None:
             types.append(pd.Series(t).value_counts(normalize=True).reindex(kinds, fill_value=0))
         acc = pd.concat(acc_by_len, axis=1)
         x = np.arange(len(acc)) + (j - (len(models) - 1) / 2) * width
-        axes[0].bar(x, acc.mean(axis=1), width * 0.92, yerr=acc.std(axis=1, ddof=1).fillna(0), color=COLORS[m],
-                    label=LABELS[m], capsize=2, edgecolor="white", linewidth=1)  # fmt: skip
+        axes[0].bar(x, acc.mean(axis=1), width * 0.92, yerr=acc.std(axis=1, ddof=1).fillna(0),
+                    color=COLORS[m], label=LABELS[m], capsize=2, edgecolor="white", linewidth=1)  # fmt: skip
         axes[0].set_xticks(np.arange(len(acc)), [f"{int(L)} digits" for L in acc.index])
         tp = pd.concat(types, axis=1).mean(axis=1)
         xx = np.arange(1, len(kinds)) + (j - (len(models) - 1) / 2) * width
         axes[1].bar(xx, tp.values[1:] * 100, width * 0.92, color=COLORS[m], label=LABELS[m],
                     edgecolor="white", linewidth=1)  # fmt: skip
     axes[1].set_xticks(np.arange(1, len(kinds)), kinds[1:])
-    axes[0].set_title(
-        "Exact-string accuracy by number length (test, mean ± sd over seeds)",
-        fontsize=9,
-        loc="left",
-    )
-    axes[1].set_title("Error types, % of test images", fontsize=9, loc="left")
+    axes[0].set_title(f"{SETTING_TEXT[setting]}: exact-string accuracy by length (test, mean ± sd)",
+                      fontsize=9, loc="left")  # fmt: skip
+    axes[1].set_title("Error types, % of test images (primary decoding)", fontsize=9, loc="left")
     axes[0].legend(frameon=False, fontsize=7, loc="lower left")
     for a in axes:
         style_axes(a)
-    save(fig, figs / "task3_length_errors")
+    save(fig, figs / f"task3_length_errors_{tag}")
 
 
 def fig_task3_protocols(root: Path, figs: Path) -> None:
-    """Exact-string accuracy per decoding/protocol mode, mean and sd over seeds."""
+    """Exact-string accuracy per setting and decoding, by model family, mean ± sd over seeds."""
     f = root / "task3_metrics_by_seed.csv"
     if not f.exists():
         return
     df = pd.read_csv(f)
-    modes = [m for m in OCR_MODES if m != "val" and m in set(df.split)]
-    names = {
-        "test": "GT crop, greedy",
-        "test_length_constrained": "GT crop, length-constrained",
-        "test_beam3": "GT crop, beam 3",
-        "test_whole": "Whole image (stress)",
-    }
-    models = [m for m in ORDER[3] if m in set(df.model)]
-    fig, ax = plt.subplots(figsize=(10, 3.4))
-    width = 0.8 / max(1, len(models))
-    for j, m in enumerate(models):
-        g = df[(df.model == m) & df.split.isin(modes)].groupby("split").exact_match
-        mu = g.mean().reindex(modes)
-        sd = g.std(ddof=1).reindex(modes).fillna(0)
-        x = np.arange(len(modes)) + (j - (len(models) - 1) / 2) * width
-        ax.bar(x, mu.values * 100, width * 0.92, yerr=sd.values * 100, color=COLORS[m],
-               label=LABELS[m], capsize=2, edgecolor="white", linewidth=1)  # fmt: skip
-    ax.set_xticks(np.arange(len(modes)), [names[m] for m in modes])
+    df = df[df.split != "val"].copy()
+    cats = [
+        ("A_oracle_crop", "test", "A: GT crop\nprimary decode"),
+        ("A_oracle_crop", "test_greedy", "A: GT crop\ngreedy (diagnostic)"),
+        ("A_oracle_crop", "test_whole", "A model on whole\nimages (stress)"),
+        ("B_whole_image", "test", "B: whole image\nprimary decode"),
+        ("B_whole_image", "test_greedy", "B: whole image\ngreedy (diagnostic)"),
+    ]
+    cats = [c for c in cats if ((df.setting == c[0]) & (df.split == c[1])).any()]
+    fams = [m for m in OCR_FAMILIES if m in set(df.family)]
+    fig, ax = plt.subplots(figsize=(11, 3.6))
+    width = 0.8 / max(1, len(fams))
+    for j, fam in enumerate(fams):
+        mu, sd = [], []
+        for setting, split, _ in cats:
+            v = df[(df.family == fam) & (df.setting == setting) & (df.split == split)].exact_match
+            mu.append(v.mean() * 100 if len(v) else np.nan)
+            sd.append(v.std(ddof=1) * 100 if len(v) > 1 else 0)
+        x = np.arange(len(cats)) + (j - (len(fams) - 1) / 2) * width
+        ax.bar(x, mu, width * 0.92, yerr=sd, color=COLORS[fam], label=LABELS[fam], capsize=2,
+               edgecolor="white", linewidth=1)  # fmt: skip
+    ax.set_xticks(np.arange(len(cats)), [c[2] for c in cats], fontsize=7)
     ax.set_ylabel("exact-string accuracy (%)")
-    ax.set_title("Task 3 test accuracy by protocol and decoding (mean ± sd over 3 seeds)",
+    ax.set_title("Task 3 test accuracy by setting and decoding (mean ± sd over 3 seeds)",
                  fontsize=9, loc="left")  # fmt: skip
     ax.legend(frameon=False, fontsize=7, ncol=2)
     style_axes(ax)
@@ -581,7 +628,8 @@ def main() -> None:
         fig_ts_attention(runs[t], t, figs)
     fig_task2_horizon(root, figs)
     cfg3 = yaml.safe_load(Path(a.config3).read_text()) if Path(a.config3).exists() else cfg
-    fig_task3(runs[3], Path(cfg3.get("svhn_dir", "data/processed/svhn")), figs)
+    for setting in ("A_oracle_crop", "B_whole_image"):
+        fig_task3(runs[3], Path(cfg3.get("svhn_dir", "data/processed/svhn")), figs, setting)
     fig_task3_protocols(root, figs)
     fig_tradeoff(root, figs)
     index = [{"file": str(p), "task": p.stem.split("_")[0]} for p in sorted(figs.glob("*.png"))]
