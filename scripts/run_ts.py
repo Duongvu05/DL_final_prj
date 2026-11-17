@@ -10,7 +10,7 @@ import yaml
 from loguru import logger
 
 from dl_final_prj.electricity import ElectricityData
-from dl_final_prj.engine import FitConfig, fit, pick_device, write_json
+from dl_final_prj.engine import FitConfig, fit, pick_device, set_seed, write_json
 from dl_final_prj.metrics import horizon_report, regression_report
 from dl_final_prj.ts_models import BiRNNForecaster, Seq2SeqForecaster, count_params
 
@@ -64,6 +64,7 @@ def main() -> None:
     if (run_dir / "metrics.json").exists() and not a.force:
         logger.info(f"{run_dir} already done")
         return
+    set_seed(a.seed)  # seeds the weight initialization too, not only training
     device = pick_device()
     data = ElectricityData(
         Path(a.npz or cfg["electricity_npz"]), tcfg["lookback"], tuple(tcfg["offsets"]), device

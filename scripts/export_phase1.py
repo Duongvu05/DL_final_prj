@@ -21,8 +21,8 @@ from loguru import logger
 from dl_final_prj.engine import write_json
 from dl_final_prj.metrics import per_sample_losses
 from dl_final_prj.stats import (
-    bootstrap_forecast_diff,
     bootstrap_image_diff,
+    bootstrap_loss_diff,
     dm_test,
     mcnemar,
 )
@@ -211,13 +211,12 @@ def paired_tests(root: Path, runs: dict[int, dict], reps: int) -> None:
             pa = [load_ts_preds(runs[task][a][s]) for s in seeds]
             pb = [load_ts_preds(runs[task][b][s]) for s in seeds]
             y = pa[0]["y_true"]
-            ya, yb = np.mean([p["y_pred"] for p in pa], 0), np.mean([p["y_pred"] for p in pb], 0)
             # Loss per origin: the seed-average of the per-seed loss (not the loss of the average forecast)
             se_a = np.mean([((p["y_pred"] - y) ** 2).mean(1) for p in pa], 0)
             se_b = np.mean([((p["y_pred"] - y) ** 2).mean(1) for p in pb], 0)
             ae_a = np.mean([np.abs(p["y_pred"] - y).mean(1) for p in pa], 0)
             ae_b = np.mean([np.abs(p["y_pred"] - y).mean(1) for p in pb], 0)
-            boot = bootstrap_forecast_diff(y, ya, yb, block=168, reps=reps, seed=task)
+            boot = bootstrap_loss_diff(y, se_a, se_b, ae_a, ae_b, block=168, reps=reps, seed=task)
             for loss, la, lb in (("squared", se_a, se_b), ("absolute", ae_a, ae_b)):
                 dm = dm_test(la, lb, lag=24)
                 rows.append({"task": task, "model_a": a, "model_b": b, "seeds": seeds, "test": "DM",
@@ -225,7 +224,14 @@ def paired_tests(root: Path, runs: dict[int, dict], reps: int) -> None:
             for k, v in boot.items():
                 rows.append({"task": task, "model_a": a, "model_b": b, "seeds": seeds,
                              "test": "block_bootstrap_168h", "metric": k, **v,
-                             "note": "difference A - B on the seed-mean forecast"})  # fmt: skip
+                             "note": "A - B from per-origin losses averaged over seeds"})  # fmt: skip
+            if task == 2:  # plan 4.3: additionally test each horizon
+                for h in range(y.shape[1]):
+                    la = np.mean([(p["y_pred"][:, h] - y[:, h]) ** 2 for p in pa], 0)
+                    lb = np.mean([(p["y_pred"][:, h] - y[:, h]) ** 2 for p in pb], 0)
+                    rows.append({"task": task, "model_a": a, "model_b": b, "seeds": seeds,
+                                 "test": "DM", "loss": "squared", "horizon": h + 1,
+                                 **dm_test(la, lb, lag=24), "seed_rule": "per-origin loss averaged over seeds"})  # fmt: skip
     for a, b in CONTRASTS[3]:
         if a not in runs[3] or b not in runs[3]:
             continue

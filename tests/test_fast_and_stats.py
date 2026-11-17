@@ -102,3 +102,33 @@ def test_mcnemar_and_holm():
     r = mcnemar(a, b)
     assert r["a_only"] == 20 and r["b_only"] == 0 and r["p_value"] < 1e-4
     assert holm([0.01, 0.04, 0.03]) == pytest.approx([0.03, 0.06, 0.06])
+
+
+def test_bootstrap_loss_diff_matches_seed_mean_metrics_not_ensemble():
+    from dl_final_prj.stats import bootstrap_loss_diff
+
+    rng = np.random.default_rng(3)
+    y = rng.normal(size=(2000, 1)).cumsum(0)
+    shared = rng.normal(0, 1.0, y.shape)
+    seeds_a = [y + shared + rng.normal(0, 2.0, y.shape) for _ in range(3)]  # noisy per seed
+    b = y + rng.normal(0, 1.6, y.shape)  # deterministic baseline
+    se_a = np.mean([((p - y) ** 2).mean(1) for p in seeds_a], 0)
+    ae_a = np.mean([np.abs(p - y).mean(1) for p in seeds_a], 0)
+    r = bootstrap_loss_diff(
+        y, se_a, ((b - y) ** 2).mean(1), ae_a, np.abs(b - y).mean(1), block=24, reps=2000
+    )
+    # A is worse per seed, so the interval must say so (an ensemble of A would look better)
+    assert r["RMSE"]["diff"] == pytest.approx(np.sqrt(se_a.mean()) - np.sqrt(((b - y) ** 2).mean()))
+    assert r["RMSE"]["ci_low"] > 0
+
+
+def test_image_bootstrap_has_char_accuracy():
+    from dl_final_prj.metrics import per_sample_losses
+    from dl_final_prj.stats import bootstrap_image_diff
+
+    t = ["12", "345", "7"] * 50
+    a = per_sample_losses(t, ["12", "345", "7"] * 50)
+    b = per_sample_losses(t, ["13", "34", "7"] * 50)
+    np.testing.assert_allclose(b["char_correct"][:3], [1, 2, 1])
+    r = bootstrap_image_diff(a, b, reps=500)
+    assert r["char_accuracy"]["diff"] == pytest.approx((6 - 4) / 6)

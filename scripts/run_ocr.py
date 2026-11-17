@@ -10,7 +10,7 @@ import torch
 import yaml
 from loguru import logger
 
-from dl_final_prj.engine import FitConfig, fit, pick_device, write_json
+from dl_final_prj.engine import FitConfig, fit, pick_device, set_seed, write_json
 from dl_final_prj.metrics import sequence_report
 from dl_final_prj.ocr_models import (
     AttentionRecognizer,
@@ -75,6 +75,7 @@ def main() -> None:
     if (run_dir / "metrics.json").exists() and not a.force:
         logger.info(f"{run_dir} already done")
         return
+    set_seed(a.seed)  # seeds the weight initialization too, not only training
     device = pick_device()
     cache = Path(a.cache or cfg["svhn_dir"])
     max_len = tcfg["max_len"]

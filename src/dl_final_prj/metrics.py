@@ -108,10 +108,11 @@ def sequence_report(targets: Sequence[str], preds: Sequence[str]) -> dict[str, f
 
 def per_sample_losses(targets: Sequence[str], preds: Sequence[str]) -> dict[str, np.ndarray]:
     """Per-image quantities for paired bootstrap and McNemar tests."""
-    (idx, _, yt, yp), _ = align_digits(targets, preds)
+    (idx, _, yt, yp), present = align_digits(targets, preds)
     n = len(targets)
     err = yp - yt
     return {
+        "char_correct": np.bincount(idx, ((yp == yt) & present).astype(np.float64), minlength=n),
         "sq_err_sum": np.bincount(idx, err**2, minlength=n),
         "abs_err_sum": np.bincount(idx, np.abs(err), minlength=n),
         "n_digits": np.bincount(idx, minlength=n).astype(np.float64),

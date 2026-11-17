@@ -39,33 +39,25 @@ def dm_test(loss_a: np.ndarray, loss_b: np.ndarray, lag: int) -> dict[str, float
     return {"mean_diff": float(d.mean()), "dm_stat": stat, "p_value": p, "lag": lag}
 
 
-def bootstrap_forecast_diff(
+def bootstrap_loss_diff(
     y: np.ndarray,
-    pred_a: np.ndarray,
-    pred_b: np.ndarray,
+    sq_a: np.ndarray,
+    sq_b: np.ndarray,
+    abs_a: np.ndarray,
+    abs_b: np.ndarray,
     block: int,
     reps: int = 10_000,
     seed: int = 0,
 ) -> dict[str, dict[str, float]]:
-    """Moving-block bootstrap of metric differences A - B over forecast origins.
+    """Moving-block bootstrap of A - B from per-origin losses (plan Section 4.3).
 
-    y, pred_a, pred_b have shape (n,) or (n, H). Rows are origins in time order and are
-    resampled in blocks, so all horizons of one origin move together. Returns the point
-    difference and the 2.5/97.5 percentiles for RMSE, MAE and NSE (pooled over horizons).
+    sq_*/abs_* are per-origin squared/absolute errors, already averaged over horizons and over
+    seeds when several seeds exist. y is (n,) or (n, H). Blocks of origins are resampled, and
+    RMSE = sqrt(mean squared error), MAE = mean absolute error, NSE = 1 - MSE / var(y) are
+    computed on each resample. Returns the point difference and the 2.5/97.5 percentiles.
     """
     y = np.asarray(y, np.float64).reshape(len(y), -1)
-    a = np.asarray(pred_a, np.float64).reshape(y.shape)
-    b = np.asarray(pred_b, np.float64).reshape(y.shape)
-    cols = np.column_stack(
-        [
-            ((a - y) ** 2).mean(1),
-            ((b - y) ** 2).mean(1),
-            np.abs(a - y).mean(1),
-            np.abs(b - y).mean(1),
-            y.mean(1),
-            (y**2).mean(1),
-        ]
-    )
+    cols = np.column_stack([sq_a, sq_b, abs_a, abs_b, y.mean(1), (y**2).mean(1)])
 
     def metrics(m: np.ndarray) -> dict[str, np.ndarray]:
         var = m[..., 5] - m[..., 4] ** 2
@@ -87,6 +79,30 @@ def bootstrap_forecast_diff(
     }
 
 
+def bootstrap_forecast_diff(
+    y: np.ndarray,
+    pred_a: np.ndarray,
+    pred_b: np.ndarray,
+    block: int,
+    reps: int = 10_000,
+    seed: int = 0,
+) -> dict[str, dict[str, float]]:
+    """Single-seed convenience wrapper. y, pred_a, pred_b have shape (n,) or (n, H)."""
+    y = np.asarray(y, np.float64).reshape(len(y), -1)
+    a = np.asarray(pred_a, np.float64).reshape(y.shape)
+    b = np.asarray(pred_b, np.float64).reshape(y.shape)
+    return bootstrap_loss_diff(
+        y,
+        ((a - y) ** 2).mean(1),
+        ((b - y) ** 2).mean(1),
+        np.abs(a - y).mean(1),
+        np.abs(b - y).mean(1),
+        block,
+        reps,
+        seed,
+    )
+
+
 def bootstrap_image_diff(
     per_a: dict[str, np.ndarray], per_b: dict[str, np.ndarray], reps: int = 10_000, seed: int = 0
 ) -> dict[str, dict[str, float]]:
@@ -100,6 +116,8 @@ def bootstrap_image_diff(
             per_a["n_digits"],
             per_a["exact"],
             per_b["exact"],
+            per_a["char_correct"],
+            per_b["char_correct"],
         ]
     )
 
@@ -108,6 +126,7 @@ def bootstrap_image_diff(
             "RMSE": np.sqrt(m[..., 0] / m[..., 4]) - np.sqrt(m[..., 1] / m[..., 4]),
             "MAE": (m[..., 2] - m[..., 3]) / m[..., 4],
             "exact_match": m[..., 5] - m[..., 6],
+            "char_accuracy": (m[..., 7] - m[..., 8]) / m[..., 4],
         }
 
     point = metrics(cols.mean(0))
