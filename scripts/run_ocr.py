@@ -320,6 +320,9 @@ def load_data(
     suffix = cfg.get("cache_suffix") or ""
     stress = stress_split(cfg)
     kw = {"crop": cfg["crop"], "jitter": cfg["color_jitter"]}
+    if cfg.get("rrc_scale"):  # RandomResizedCrop training augmentation (improvement I2)
+        kw["rrc_scale"] = tuple(cfg["rrc_scale"])
+        kw["rrc_ratio"] = tuple(cfg.get("rrc_ratio", (3 / 4, 4 / 3)))
     if reverse_target(cfg):  # training targets of a right-to-left decoder
         kw["reverse"] = True
     names = [s for s in ("train", "val", "test") if train or s != "train"]
@@ -624,7 +627,13 @@ def build_spec(
         "cache_suffix": suffix,
         "crop_protocol": {
             "cache": cache_text,
-            "train": f"random {crop}x{crop} crop, ColorJitter brightness/contrast/saturation "
+            "train": (
+                f"RandomResizedCrop to {crop}x{crop}, area {cfg['rrc_scale']}, aspect "
+                f"{cfg.get('rrc_ratio', [0.75, 1.3333])}"
+                if cfg.get("rrc_scale")
+                else f"random {crop}x{crop} crop"
+            )
+            + ", ColorJitter brightness/contrast/saturation "
             f"factors in [{1 - cfg['color_jitter']:.1f}, {1 + cfg['color_jitter']:.1f}]",
             "eval": f"center {crop}x{crop} crop",
             "stress_split": stress,
@@ -840,6 +849,8 @@ def main() -> None:
 
     cfg = yaml.safe_load(Path(a.config).read_text())
     mcfg = cfg["models"][a.model]
+    # per-model data/training overrides (Task 3 improvement study), e.g. rrc_scale
+    cfg = {**cfg, **(mcfg.get("data") or {})}
     kind = mcfg["kind"]
     if a.bench:
         if a.scan:

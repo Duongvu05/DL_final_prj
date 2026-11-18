@@ -1,0 +1,60 @@
+# Task 3 improvement study, Setting B at higher resolution: whole image stretched to 96x96
+# (cache suffix _full96, same records and splits), random 80x80 training crop, center 80x80
+# evaluation crop, token grid 10x10. No boxes. Results in results/improve/runs/task3/.
+#   i5_res96_whole  T3-I5  resolution only, otherwise the Phase 1 cnn_attention_gru_whole
+#   i6_combo_whole  T3-I6  pre-registered combination I2 + I3 + I4 + I5 (the STN keeps the 80x80
+#                          resolution of I5, so its output is 80x80 rather than I4's 64x64)
+title: Full house-number recognition from whole SVHN images (no ground-truth box)
+seeds:
+- 0
+- 1
+- 2
+results_root: results
+svhn_dir: data/processed/svhn
+cache_suffix: _full96
+stress_split: null
+size: 96
+crop: 80
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit:
+  epochs: 16
+  patience: 16
+  lr: 0.0003
+  weight_decay: 0.0001
+  clip: 5.0
+  schedule: step
+  step_epoch: 10
+  step_gamma: 0.1
+  amp: bf16
+length_loss_weight: 0.2
+color_jitter: 0.3
+models:
+  i5_res96_whole:
+    kind: attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      input_size: 80
+  i6_combo_whole:
+    kind: attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      input_size: 80
+      stn_out: 80
+      label_smoothing: 0.05
+    data:
+      rrc_scale:
+      - 0.7
+      - 1.0
+      rrc_ratio:
+      - 0.75
+      - 1.3333
+phase: improve

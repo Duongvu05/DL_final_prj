@@ -33,6 +33,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
 from loguru import logger
 
 from dl_final_prj.fast import letterbox_images
@@ -634,6 +635,41 @@ def color_jitter(x: torch.Tensor, factors: torch.Tensor) -> torch.Tensor:
     return (f[2] * x + (1 - f[2]) * gray).clamp(0, 1)
 
 
+def random_resized_crop(
+    x: torch.Tensor,
+    crop: int,
+    scale: tuple[float, float],
+    ratio: tuple[float, float],
+    g: torch.Generator | None,
+) -> torch.Tensor:
+    """RandomResizedCrop on the device for a batch x (B, C, S, S) in [0, 1].
+
+    Per image: area fraction s ~ U(scale), aspect r with log r ~ U(log ratio), box width
+    sqrt(s*S^2*r) and height sqrt(s*S^2/r) (clamped to the canvas), uniform position inside the
+    canvas, then a bilinear resample of that box to (crop, crop). Random numbers come from the
+    CPU generator g, so a resumed epoch sees the same boxes.
+    """
+    b, size = x.shape[0], x.shape[-1]
+    u = torch.rand(b, 4, generator=g)
+    area = (scale[0] + u[:, 0] * (scale[1] - scale[0])) * size * size
+    log_r = math.log(ratio[0]) + u[:, 1] * (math.log(ratio[1]) - math.log(ratio[0]))
+    r = torch.exp(log_r)
+    w = torch.sqrt(area * r).clamp(1, size)
+    h = torch.sqrt(area / r).clamp(1, size)
+    left = u[:, 2] * (size - w)
+    top = u[:, 3] * (size - h)
+    zero = torch.zeros(b)
+    theta = torch.stack(
+        [
+            torch.stack([w / size, zero, (left + w / 2) / size * 2 - 1], -1),
+            torch.stack([zero, h / size, (top + h / 2) / size * 2 - 1], -1),
+        ],
+        1,
+    ).to(x.device, x.dtype)
+    grid = F.affine_grid(theta, [b, x.shape[1], crop, crop], align_corners=False)
+    return F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+
 class SvhnSplit:
     """One cached split held on the device as (N, 3, size, size) uint8.
 
@@ -646,6 +682,9 @@ class SvhnSplit:
 
     reverse=True (opt-in, right-to-left decoders) encodes the decoder targets of the reversed
     digit string ("123" -> tokens of "321", EOS). `labels` and `lengths` stay left-to-right.
+
+    rrc_scale (opt-in, Task 3 improvement I2) replaces the translation-only training crop by
+    random_resized_crop with that area range and rrc_ratio. Evaluation is unchanged.
     """
 
     def __init__(
@@ -659,7 +698,11 @@ class SvhnSplit:
         limit: int | None = None,
         suffix: str = "",
         reverse: bool = False,
+        rrc_scale: tuple[float, float] | None = None,
+        rrc_ratio: tuple[float, float] = (3 / 4, 4 / 3),
     ) -> None:
+        self.rrc_scale = None if rrc_scale is None else (float(rrc_scale[0]), float(rrc_scale[1]))
+        self.rrc_ratio = (float(rrc_ratio[0]), float(rrc_ratio[1]))
         imgs = np.load(Path(cache_dir) / f"{split}{suffix}_images.npy", mmap_mode="r")
         records = json.loads((Path(cache_dir) / f"{split}{suffix}_labels.json").read_text())
         if limit is not None:
@@ -692,6 +735,14 @@ class SvhnSplit:
     ) -> OcrBatch:
         idx = idx.to(self.device)
         b, margin = len(idx), self.size - self.crop
+        if train and self.rrc_scale is not None:
+            x = self.images[idx].float() / 255.0
+            x = random_resized_crop(x, self.crop, self.rrc_scale, self.rrc_ratio, g)
+            factors = 1 + (torch.rand(b, 3, generator=g) * 2 - 1) * self.jitter
+            if self.jitter > 0:
+                x = color_jitter(x, factors.to(self.device))
+            x = (x - self.mean) / self.std
+            return OcrBatch(x, self.tokens[idx], self.lengths[idx], idx)
         if train:
             off = torch.randint(0, margin + 1, (b, 2), generator=g)
             factors = 1 + (torch.rand(b, 3, generator=g) * 2 - 1) * self.jitter

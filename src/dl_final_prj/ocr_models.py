@@ -96,11 +96,70 @@ class VggEncoder(nn.Module):
         return self.net(x)
 
 
-class TokenEncoder(nn.Module):
-    """VGG encoder -> (B, h*w, C) tokens in raster order plus learned row/column embeddings."""
+def vgg_grid(size: int) -> int:
+    """Side of the VGG token map for a square input: three ceil-mode 2x2 pools."""
+    for _ in range(3):
+        size = math.ceil(size / 2)
+    return size
 
-    def __init__(self, grid: tuple[int, int] = (7, 7), dropout: float = 0.1) -> None:
+
+class AffineSTN(nn.Module):
+    """Spatial transformer (Jaderberg et al., 2015) with an affine warp and no box labels.
+
+    A small localisation CNN regresses the 6 affine parameters from the image. The last layer
+    starts at zero weights and an identity bias, so training starts from the unwarped image.
+    The warped image is resampled to (out_size, out_size) with bilinear sampling.
+    """
+
+    def __init__(self, out_size: int) -> None:
         super().__init__()
+        self.out_size = out_size
+        self.loc = nn.Sequential(
+            nn.Conv2d(3, 32, 5, stride=2, padding=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 5, stride=2, padding=2),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(4),
+            nn.Flatten(),
+            nn.Linear(64 * 16, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 6),
+        )
+        last = self.loc[-1]
+        assert isinstance(last, nn.Linear)
+        nn.init.zeros_(last.weight)
+        with torch.no_grad():
+            last.bias.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+    def theta(self, images: torch.Tensor) -> torch.Tensor:
+        return self.loc(images).float().view(-1, 2, 3)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        x = images.float()
+        size = [x.shape[0], x.shape[1], self.out_size, self.out_size]
+        grid = F.affine_grid(self.theta(x), size, align_corners=False)
+        return F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
+class TokenEncoder(nn.Module):
+    """VGG encoder -> (B, h*w, C) tokens in raster order plus learned row/column embeddings.
+
+    input_size sets the token grid (54 -> 7x7, 64 -> 8x8, 80 -> 10x10). With stn_out an affine
+    spatial transformer warps the input to stn_out x stn_out before the CNN (improvement I4).
+    """
+
+    def __init__(
+        self,
+        grid: tuple[int, int] | None = None,
+        dropout: float = 0.1,
+        input_size: int = 54,
+        stn_out: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.stn = AffineSTN(stn_out) if stn_out else None
+        if grid is None:
+            g = vgg_grid(stn_out or input_size)
+            grid = (g, g)
         self.cnn = VggEncoder(dropout=dropout)
         c = self.cnn.out_channels
         self.grid, self.dim = grid, c
@@ -108,6 +167,8 @@ class TokenEncoder(nn.Module):
         self.col = nn.Parameter(torch.randn(grid[1], c) * 0.02)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if self.stn is not None:
+            images = self.stn(images)
         f = self.cnn(images).float()
         _, c, h, w = f.shape
         if (h, w) != self.grid:
@@ -140,11 +201,15 @@ class GRUDecoderRecognizer(nn.Module):
         emb_dim: int = 64,
         length_loss_weight: float = 0.2,
         dropout: float = 0.1,
+        label_smoothing: float = 0.0,
+        input_size: int = 54,
+        stn_out: int | None = None,
     ) -> None:
         super().__init__()
         self.max_len, self.hidden, self.layers = max_len, hidden, layers
         self.length_loss_weight = length_loss_weight
-        self.encoder = TokenEncoder(dropout=dropout)
+        self.label_smoothing = label_smoothing
+        self.encoder = TokenEncoder(dropout=dropout, input_size=input_size, stn_out=stn_out)
         c = self.encoder.dim
         self.attn = AdditiveAttention(hidden, c, attn_dim) if self.attention else None
         self.emb = nn.Embedding(VOCAB, emb_dim)
@@ -201,10 +266,15 @@ class GRUDecoderRecognizer(nn.Module):
 
     def loss(self, b: OcrBatch) -> torch.Tensor:
         logits, length_logits, _ = self(b.images, b.tokens)
+        ls = getattr(self, "label_smoothing", 0.0)  # subclasses with their own __init__
         tok = F.cross_entropy(
-            logits.float().reshape(-1, VOCAB), b.tokens.reshape(-1), ignore_index=PAD
+            logits.float().reshape(-1, VOCAB),
+            b.tokens.reshape(-1),
+            ignore_index=PAD,
+            label_smoothing=ls,
         )
-        return tok + self.length_loss_weight * F.cross_entropy(length_logits.float(), b.lengths)
+        length = F.cross_entropy(length_logits.float(), b.lengths, label_smoothing=ls)
+        return tok + self.length_loss_weight * length
 
     # --- decoding ----------------------------------------------------------------
 

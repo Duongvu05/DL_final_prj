@@ -1,0 +1,66 @@
+# Task 3 improvement study, Setting B (whole image, 64x64 cache, 54x54 crops, no boxes).
+# Single-factor changes to the Phase 1 cnn_attention_gru_whole (T3-I0), everything else identical
+# to configs/phase1_task3_whole.yaml. Results go to results/improve/runs/task3/<model>/seed<s>.
+#   i2_rrc_whole  T3-I2  RandomResizedCrop(54, area 0.70-1.00, aspect 3/4-4/3)
+#   i3_ls_whole   T3-I3  label smoothing 0.05
+#   i4_stn_whole  T3-I4  identity-initialised affine spatial transformer before the VGG, output
+#                        64x64 (token grid 8x8), no box labels
+title: Full house-number recognition from whole SVHN images (no ground-truth box)
+seeds:
+- 0
+- 1
+- 2
+results_root: results
+svhn_dir: data/processed/svhn
+cache_suffix: _full
+stress_split: null
+size: 64
+crop: 54
+max_len: 5
+val_frac: 0.1
+batch_size: 64
+eval_batch_size: 512
+fit:
+  epochs: 16
+  patience: 16
+  lr: 0.0003
+  weight_decay: 0.0001
+  clip: 5.0
+  schedule: step
+  step_epoch: 10
+  step_gamma: 0.1
+  amp: bf16
+length_loss_weight: 0.2
+color_jitter: 0.3
+models:
+  i2_rrc_whole:
+    kind: attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+    data:
+      rrc_scale:
+      - 0.7
+      - 1.0
+      rrc_ratio:
+      - 0.75
+      - 1.3333
+  i3_ls_whole:
+    kind: attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      label_smoothing: 0.05
+  i4_stn_whole:
+    kind: attention
+    args:
+      hidden: 256
+      layers: 2
+      attn_dim: 256
+      emb_dim: 64
+      stn_out: 64
+phase: improve
