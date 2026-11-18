@@ -106,7 +106,11 @@ def bootstrap_forecast_diff(
 def bootstrap_image_diff(
     per_a: dict[str, np.ndarray], per_b: dict[str, np.ndarray], reps: int = 10_000, seed: int = 0
 ) -> dict[str, dict[str, float]]:
-    """Paired i.i.d. bootstrap over test images of A - B, using metrics.per_sample_losses output."""
+    """Paired i.i.d. bootstrap over test images of A - B, using metrics.per_sample_losses output.
+
+    Returns, per metric, the point difference, the 2.5/97.5 percentiles and a two-sided
+    percentile-bootstrap p-value 2 * min(P(boot <= 0), P(boot >= 0)) (floored at 1/reps).
+    """
     cols = np.column_stack(
         [
             per_a["sq_err_sum"],
@@ -118,6 +122,8 @@ def bootstrap_image_diff(
             per_b["exact"],
             per_a["char_correct"],
             per_b["char_correct"],
+            per_a["edit"],
+            per_b["edit"],
         ]
     )
 
@@ -127,6 +133,7 @@ def bootstrap_image_diff(
             "MAE": (m[..., 2] - m[..., 3]) / m[..., 4],
             "exact_match": m[..., 5] - m[..., 6],
             "char_accuracy": (m[..., 7] - m[..., 8]) / m[..., 4],
+            "mean_edit_distance": m[..., 9] - m[..., 10],
         }
 
     point = metrics(cols.mean(0))
@@ -136,6 +143,12 @@ def bootstrap_image_diff(
             "diff": float(point[k]),
             "ci_low": float(np.percentile(boot[k], 2.5)),
             "ci_high": float(np.percentile(boot[k], 97.5)),
+            "p_value": float(
+                max(
+                    1.0 / reps,
+                    min(1.0, 2 * min(float(np.mean(boot[k] <= 0)), float(np.mean(boot[k] >= 0)))),
+                )
+            ),
         }
         for k in point
     }

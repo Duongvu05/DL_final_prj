@@ -162,3 +162,16 @@ def test_image_bootstrap_has_char_accuracy():
     np.testing.assert_allclose(b["char_correct"][:3], [1, 2, 1])
     r = bootstrap_image_diff(a, b, reps=500)
     assert r["char_accuracy"]["diff"] == pytest.approx((6 - 4) / 6)
+
+
+def test_image_bootstrap_p_values_and_edit_distance():
+    from dl_final_prj.metrics import per_sample_losses
+    from dl_final_prj.stats import bootstrap_image_diff
+
+    t = ["12", "345", "7"] * 200
+    better = per_sample_losses(t, ["12", "345", "7"] * 200)
+    worse = per_sample_losses(t, ["13", "34", "7"] * 200)
+    r = bootstrap_image_diff(better, worse, reps=2000)
+    assert r["exact_match"]["p_value"] < 0.01 and r["mean_edit_distance"]["diff"] < 0
+    same = bootstrap_image_diff(worse, worse, reps=2000)
+    assert same["exact_match"]["p_value"] == 1.0
